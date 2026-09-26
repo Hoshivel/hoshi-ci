@@ -5,7 +5,8 @@
 ## 做什麼
 
 - **`派工`**（`dispatch.yml`）：每 15 分鐘與手動。列出 [`targets.json`](targets.json) 裡
-  每個倉庫的分支 head，還沒有 run 的 commit 各派一次 `Windows`。
+  每個倉庫的分支 head，還沒有 run 的 commit 各派一次 `Windows`。排程會延遲，等結果時
+  不必等它，手動派一次即可（見下方〈手動〉）。
 - **`Windows`**（`windows.yml`）：checkout 那個 commit，讀它自己
   `.github/workflows/ci.yml` 的 `verify-windows` job，照步驟在 `windows-latest` 上跑。
   這裡不另寫指令——要改驗證內容，改那個倉庫的 job。
