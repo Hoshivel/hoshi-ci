@@ -10,7 +10,8 @@
 3. 任何 workflow 都不掛外人觸發得了、又拿得到 secret 的事件
    （`pull_request_target`、`workflow_run`、`issue_comment`…）。
 4. 拿得到 HOSHIVEL_CI_TOKEN 的 workflow 只由 `schedule` 與 `workflow_dispatch` 觸發，
-   不用快取、不上傳 artifact，`setup-go` 明寫 `cache: false`。
+   不用快取、不上傳 artifact，`setup-go` 明寫 `cache: false`，也不以 `actions/checkout`
+   取別的倉庫——它會把 commit 標題（`HEAD is now at …`）印進日誌。
 5. 沒有 `id-token: write`、`permissions: write-all`、`environment:`、`secrets: inherit`。
 
 **認不出來一律算不合規**：認不出來就檢查不到，而檢查不到的輸出與「檢查過，沒問題」
@@ -118,6 +119,8 @@ def check_doc(name: str, doc: object) -> list[str]:
                 problems.append(f"{name}：拿得到 {TOKEN}，卻用了 {action}")
             if action == "actions/setup-go" and (step.get("with") or {}).get("cache") is not False:
                 problems.append(f"{name}：拿得到 {TOKEN}，setup-go 卻沒有寫 cache: false")
+            if action == "actions/checkout" and {"repository", "token"} & set(step.get("with") or {}):
+                problems.append(f"{name}：以 actions/checkout 取別的倉庫，commit 標題會進公開日誌")
     return problems
 
 
@@ -137,7 +140,8 @@ def selftest() -> int:
         "on": {"workflow_dispatch": None},
         "permissions": {"contents": "read"},
         "jobs": {"j": {"runs-on": "windows-latest", "steps": [
-            {"uses": f"actions/checkout@{sha}", "with": {"token": "${{ secrets.HOSHIVEL_CI_TOKEN }}"}},
+            {"uses": f"actions/checkout@{sha}", "with": {"path": "ci", "persist-credentials": False}},
+            {"run": "git fetch -q", "env": {"TOKEN": "${{ secrets.HOSHIVEL_CI_TOKEN }}"}},
             {"uses": f"actions/setup-go@{sha}", "with": {"cache": False}},
         ]}},
     }
@@ -156,7 +160,8 @@ def selftest() -> int:
         "tag 釘版": lambda d: d["jobs"]["j"]["steps"].append({"uses": "actions/cache@v4"}),
         "快取": lambda d: d["jobs"]["j"]["steps"].append({"uses": f"actions/cache/restore@{sha}"}),
         "artifact": lambda d: d["jobs"]["j"]["steps"].append({"uses": f"actions/upload-artifact@{sha}"}),
-        "setup-go 快取": lambda d: d["jobs"]["j"]["steps"][1].update({"with": {}}),
+        "setup-go 快取": lambda d: d["jobs"]["j"]["steps"][2].update({"with": {}}),
+        "checkout 別的倉庫": lambda d: d["jobs"]["j"]["steps"][0]["with"].update({"repository": "o/private"}),
         "別的 secret": lambda d: d["jobs"]["j"].update({"env": {"X": "${{ secrets.DEPLOY_KEY }}"}}),
         "動態 secret": lambda d: d["jobs"]["j"].update({"env": {"X": "${{ toJSON(secrets) }}"}}),
         "id-token": lambda d: d["jobs"]["j"].update({"permissions": {"id-token": "write"}}),
