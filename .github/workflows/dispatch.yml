@@ -1,0 +1,44 @@
+# 派工：替還沒驗過的每個分支 head 派一次 `windows.yml`。
+#
+# **只由排程與手動觸發。** 這支拿得到 HOSHIVEL_CI_TOKEN，而本倉庫是公開的：
+# `pull_request_target`、`workflow_run`、`issue_comment` 這類外人觸發得了的事件
+# 會把 secret 交給別人決定的程式碼，一個都不掛。
+#
+# 被驗證的倉庫不持有任何指向這裡的憑證——hoshi-ci 主動去拉，沒有人往這裡推。
+# 做法與理由見 `tools/dispatch.py` 檔頭。
+name: 派工
+
+on:
+  schedule:
+    # 每 15 分鐘，避開整點與半點——那兩個時刻整個 GitHub 的排程一起醒來。
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+
+# 同時只有一次派工在跑；前一次還沒結束時，下一次排隊而不是重複派。
+concurrency:
+  group: dispatch
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # 派 `windows.yml`（workflow_dispatch 是 GITHUB_TOKEN 觸發得了新 run 的例外）
+  # 與讀它的 run 清單。
+  actions: write
+
+jobs:
+  dispatch:
+    name: 派工
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 列分支 head 並派工
+        env:
+          # 唯讀：只用來列被驗證倉庫的分支。
+          SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
+          # 本倉庫自己的：派 run、讀 run 清單。
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/dispatch.py
