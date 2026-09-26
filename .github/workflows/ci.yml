@@ -1,0 +1,52 @@
+# 本倉庫自己的驗證：三支工具的內建案例、workflow 的公開倉庫檢查，與安全掃描。
+#
+# **這支拿不到 HOSHIVEL_CI_TOKEN，所以可以掛 `pull_request`**：fork 的 PR 只拿到唯讀的
+# GITHUB_TOKEN，沒有任何 secret，而本倉庫沒有快取可讀（`tools/check-workflows.py` 守著）。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一個 PR 上再推一次就取消前一次；`main` 不取消。
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: 驗證
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # 與 windows.yml 同一個版本。
+      - name: 安裝 PyYAML
+        run: python -m pip install --disable-pip-version-check --quiet pyyaml==6.0.3
+
+      - run: python tools/dispatch.py selftest
+      - run: python tools/run-job.py selftest
+      - run: python tools/check-workflows.py selftest
+      - run: python tools/check-workflows.py
+
+  # 本倉庫是公開的，掃描不必等 `verify`，同時起跑。
+  security:
+    name: 安全掃描
+    uses: ./.github/workflows/security.yml
+    permissions:
+      contents: read
+      # Trivy 上傳 SARIF。
+      security-events: write

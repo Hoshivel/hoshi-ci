@@ -1,0 +1,113 @@
+# Windows 原生驗證：照被驗證倉庫那個 commit 自己的 `verify-windows` 跑。
+#
+# 由 `dispatch.yml` 派出，也可手動：
+#
+#   gh workflow run windows.yml -R Hoshivel/hoshi-ci -f repo=<倉庫> -f sha=<40 字元 commit>
+#
+# **不在這裡重列指令。** `tools/run-job.py` 讀那個 commit 的 `.github/workflows/ci.yml`，
+# 取出 `verify-windows` 照步驟執行；私有倉庫改了那個 job，這裡跑的就跟著改。
+#
+# **token 出現在哪裡。** HOSHIVEL_CI_TOKEN 只交給兩步：checkout（`persist-credentials:
+# false`，做完不留在 `.git/config`）與 `go mod download`（insteadOf 以行程環境變數帶入，
+# 不寫進任何設定檔）。被驗證的程式碼與它的相依在那之後才執行，拿不到它。
+#
+# **公開日誌裡有什麼。** 本倉庫是公開的：每一步只印成敗，失敗的那一步只印失敗的測試、
+# 套件與工具鏈錯誤。不開快取——fork 的 PR 讀得到預設分支的快取；不上傳 artifact。
+name: Windows
+run-name: Windows ${{ inputs.repo }}@${{ inputs.sha }}
+
+on:
+  # 只有手動與 `dispatch.yml`。這支拿得到 HOSHIVEL_CI_TOKEN，外人觸發得了的事件
+  # 一個都不掛（同 `dispatch.yml`）。
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 被驗證的倉庫（必須列在 targets.json 的 windows）
+        required: true
+        type: string
+      sha:
+        description: 40 字元的 commit SHA
+        required: true
+        type: string
+
+# 同一個 commit 同時只跑一次。
+concurrency:
+  group: windows-${{ inputs.repo }}-${{ inputs.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify-windows
+    runs-on: windows-latest
+    # 被驗證 job 自己的 timeout-minutes 由 run-job.py 執行；這裡是整個 job 的上限，
+    # 多出來的是 checkout、setup-go 與 module 下載。
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci
+          persist-credentials: false
+
+      # 輸入經 env 交給腳本，不以 `${{ }}` 直接展開進 shell。
+      - name: 檢查輸入
+        env:
+          REPO: ${{ inputs.repo }}
+          SHA: ${{ inputs.sha }}
+        run: python ci/tools/dispatch.py check --repo "${REPO}" --sha "${SHA}"
+
+      - name: checkout 被驗證的 commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.repo }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.HOSHIVEL_CI_TOKEN }}
+          path: src
+          persist-credentials: false
+
+      - name: 安裝 PyYAML
+        run: python -m pip install --disable-pip-version-check --quiet pyyaml==6.0.3
+
+      - name: 讀 verify-windows 的定義
+        id: plan
+        run: python ci/tools/run-job.py plan --src src --output "${GITHUB_OUTPUT}"
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: src/${{ steps.plan.outputs.go-version-file }}
+          # 本倉庫是公開的，fork 的 PR 讀得到預設分支的快取，而這份快取會是私有倉庫的
+          # 相依與編譯產物。
+          cache: false
+
+      # 唯一碰得到 token 的 Go 步驟。insteadOf 用 GIT_CONFIG_* 環境變數帶入，只活在這個
+      # 行程裡：不寫 `~/.gitconfig`，這一步結束它就不存在了。GOPRIVATE 也只放在這一步——
+      # 之後的步驟用被驗證 job 自己的 env，與它在私有倉庫跑時一樣。
+      - name: 下載 module
+        env:
+          TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
+          GOPRIVATE: github.com/hoshivel/*
+          MODULE_DIR: src/${{ steps.plan.outputs.module-dir }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::缺少 HOSHIVEL_CI_TOKEN。它是 organization secret，本倉庫要在它的可見範圍內；權限只需要 Contents: Read-only。"
+            exit 1
+          fi
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${TOKEN}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+          cd "${MODULE_DIR}"
+          if ! go mod download > "${RUNNER_TEMP}/mod-download.log" 2>&1; then
+            # 只印 go 自己的錯誤行，並拿掉 URL 裡的帳密。
+            grep -E '^go: ' "${RUNNER_TEMP}/mod-download.log" | sed -E 's#://[^/@]*@#://#g' | head -20 || true
+            echo "::error::go mod download 失敗"
+            exit 1
+          fi
+
+      - name: verify-windows
+        run: python ci/tools/run-job.py run --src src

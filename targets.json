@@ -1,0 +1,12 @@
+{
+  "windows": [
+    "ShatteredRealms",
+    "hoshi-admin",
+    "hoshi-data",
+    "hoshi-deploy",
+    "hoshi-identity",
+    "hoshi-mail",
+    "hoshi-platform-sdk",
+    "hoshi-svc"
+  ]
+}

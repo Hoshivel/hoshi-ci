@@ -1,0 +1,89 @@
+# 安全掃描：Gitleaks 與 Trivy（hoshi-platform-standards `engineering/supply-chain.md` §3）。
+#
+# 本倉庫沒有 Go 或 JS 原始碼，所以沒有 CodeQL 與 govulncheck。寫法同 hoshi-standards
+# 的 `security.yml`，理由也在那一份：由 `ci.yml` 以 `workflow_call` 呼叫，每週排程是
+# 獨立的第二個進入點。
+name: 安全掃描
+
+on:
+  workflow_call:
+  schedule:
+    - cron: "41 4 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # 掃整個歷史：被刪掉的憑證仍然在歷史裡。
+          fetch-depth: 0
+          persist-credentials: false
+
+      # 釘住的 release 執行檔，校驗碼比對過才解壓（官方 action 對組織帳號要授權金鑰）。
+      - name: 安裝 gitleaks 8.30.1
+        run: |
+          set -euo pipefail
+          curl -fsSL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+
+      - name: 掃描
+        run: ./gitleaks git --redact --report-format sarif --report-path gitleaks.sarif --exit-code 1 --log-opts=HEAD .
+
+      - name: 保留報告
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          retention-days: 30
+          if-no-files-found: warn
+
+  trivy:
+    name: Trivy
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 掃描相依與設定
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy.sarif
+          exit-code: "0"
+          ignore-unfixed: true
+          # 本倉庫不留任何快取（見 windows.yml），漏洞資料庫也一樣每次重抓。
+          cache: "false"
+
+      - name: 上傳到 code scanning
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: 保留報告
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-sarif
+          path: trivy.sarif
+          retention-days: 30
+          if-no-files-found: warn

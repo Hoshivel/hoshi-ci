@@ -1,0 +1,15 @@
+# 釘住的 action SHA 要有東西負責更新（hoshi-platform-standards
+# `engineering/supply-chain.md` §2）。寫法與理由同 hoshi-standards 的 dependabot.yml：
+# 全部收在一個 PR 裡，每週最多一個。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
