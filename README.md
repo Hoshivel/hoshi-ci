@@ -16,16 +16,17 @@
 
 ## 公開日誌裡有什麼
 
-- 每一步的名稱、成敗與時間。失敗的那一步只印失敗的測試、套件與工具鏈錯誤，
-  不印原始碼、斷言訊息或測試輸出。
+- 倉庫名、commit，以及每一步的名稱、成敗與時間。失敗的那一步只印失敗的測試、套件與
+  工具鏈錯誤，不印原始碼、commit 訊息、斷言訊息或測試輸出。
 - 不上傳 artifact，不留任何快取。
 - 要看失敗的細節：在 Windows 開發機 checkout 同一個 commit，重跑失敗的那一步。
 
 ## 憑證
 
 `HOSHIVEL_CI_TOKEN`（organization secret，Contents: Read-only）只出現在三處：派工時列分支、
-checkout（`persist-credentials: false`），以及 `go mod download`（insteadOf 以行程環境
-變數帶入，不寫進設定檔）。被驗證的程式碼在那之後才執行，拿不到它。
+取得被驗證的 commit，以及 `go mod download`。後兩處都以 `GIT_CONFIG_*` 行程環境變數帶入
+insteadOf，不寫進設定檔；被驗證的程式碼在那之後才執行，拿不到它。取得 commit 不用
+`actions/checkout`，因為它會把 commit 標題印進日誌。
 
 拿得到它的兩支 workflow 只由排程與手動觸發。這些承諾由 `tools/check-workflows.py` 檢查，
 `CI` 每次都跑。

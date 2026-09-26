@@ -33,8 +33,9 @@
 
 - **本倉庫是公開的。** 拿得到 `HOSHIVEL_CI_TOKEN` 的 workflow 只能由 `schedule` 與
   `workflow_dispatch` 觸發，不得用快取或上傳 artifact；由 `tools/check-workflows.py` 擋下。
-- token 只能交給列分支、checkout 與 `go mod download`；被驗證的程式碼開始執行之後的
-  步驟不得再拿到它。
+- token 只能交給列分支、取得被驗證的 commit 與 `go mod download`；被驗證的程式碼開始
+  執行之後的步驟不得再拿到它。取得 commit 不得用 `actions/checkout`（它把 commit 標題
+  印進日誌）。
 - 被驗證倉庫的輸出不得原樣印進日誌；新增可公開的輸出行要改 `run-job.py` 的 `SHOWN`，
   並在 selftest 補一行。
 - 不在這裡重列被驗證倉庫的指令：`windows.yml` 照那個 commit 自己的 `verify-windows` 跑。
