@@ -11,6 +11,11 @@ name: 派工
 on:
   schedule:
     # 每 15 分鐘，避開整點與半點——那兩個時刻整個 GitHub 的排程一起醒來。
+    #
+    # **排程不保證準時，也不保證馬上開始。** 本倉庫 2026-09-26 15:39Z 加上這一行，之後
+    # 一個多小時裡六格都沒有觸發，而手動觸發照常；GitHub 社群有同樣的回報，新倉庫的排程
+    # 過了約兩天才開始觸發。所以等結果的人不必等排程：手動 `gh workflow run dispatch.yml
+    # -R Hoshivel/hoshi-ci` 立刻派，已經派過的 commit 不會重派。
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
 
