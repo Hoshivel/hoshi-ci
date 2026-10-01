@@ -1,5 +1,7 @@
 # hoshi-ci
 
+> **已撤回（2026-10-01）**：計費週期重置後，Hoshivel 私有倉庫的 Windows 原生驗證已恢復由各倉庫的非草稿 PR 與手動 workflow 執行。`dispatch.yml` 與 `windows.yml` 已停用，這個倉庫已封存；若要重新啟用，先依 workspace 待辦重新評估。
+
 在這個公開倉庫的 runner 上，代跑 Hoshivel 私有倉庫的 Windows 原生驗證。
 
 ## 做什麼
