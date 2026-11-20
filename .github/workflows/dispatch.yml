@@ -12,11 +12,10 @@ on:
   schedule:
     # 每 15 分鐘，避開整點與半點——那兩個時刻整個 GitHub 的排程一起醒來。
     #
-    # **排程不保證準時，也不保證馬上開始。** 本倉庫 2026-09-26 15:39Z 加上這一行，之後
-    # 一個多小時裡六格都沒有觸發，而手動觸發照常；GitHub 社群有同樣的回報，新倉庫的排程
-    # 過了約兩天才開始觸發。所以等結果的人不必等排程：手動 `gh workflow run dispatch.yml
-    # -R Hoshivel/hoshi-ci` 立刻派，已經派過的 PR head 不會因 base 前進而重派。
-    - cron: "7,22,37,52 * * * *"
+    # active 或手動成功不代表自然排程已觸發。依官方恢復入口更新 cron，
+    # 仍須以 event=schedule 的實際 run 驗收；延遲時可具名手動補派，head 去重照常。
+    # https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflow-stopped-running
+    - cron: "8,23,38,53 * * * *"
   workflow_dispatch:
     inputs:
       repo:

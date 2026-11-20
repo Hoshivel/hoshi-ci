@@ -46,6 +46,16 @@ insteadOf，不寫進設定檔；被驗證的程式碼在那之後才執行，�
 拿得到它的兩支 workflow 只由排程與手動觸發。這些承諾由 `tools/check-workflows.py` 檢查，
 `CI` 每次都跑。
 
+## 排程未觸發時
+
+`active` 或 `workflow_dispatch` 成功不能代替自然排程驗收；須實際讀到 `event=schedule`
+的 run 並核對派工結果。[GitHub 官方排查](https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflow-stopped-running)
+說明已啟用的排程仍可能停止，有寫入權限的使用者可修改 cron 重新指定 actor；這個恢復動作
+不等於已證明原 actor 失效，也不保證立即觸發。排程亦可能因平台負載延遲或被捨棄。
+
+等待期間保留具名手動入口。先查相同 head 的 run 與尚未辨識來源的 queued 工作，
+確認沒有重複後才補派；缺少中央真實成功結果時仍不得以來源 skipped 放行合併。
+
 ## 手動
 
 ```sh
