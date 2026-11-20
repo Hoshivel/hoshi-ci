@@ -192,12 +192,17 @@ def dispatch() -> int:
     if ref != DEFAULT_BRANCH:
         raise ValueError("dispatcher requires its default branch")
     manual = os.environ.get("MANUAL_REPO", "")
+    manual_pr = os.environ.get("MANUAL_PR", "")
+    if manual_pr and (not manual or not manual_pr.isascii() or not manual_pr.isdigit() or int(manual_pr) < 1):
+        raise ValueError("manual PR requires an allowed repository and positive number")
     selected = [manual] if manual else load_targets(enabled=True)
     if manual and manual not in load_targets():
         raise ValueError("manual target is not allowed")
     for repo in selected:
         try:
             heads[repo] = branch_heads(owner, repo, source)
+            if manual_pr:
+                heads[repo] = [(number, sha) for number, sha in heads[repo] if number == manual_pr]
         except urllib.error.HTTPError as err:
             unreadable.append((repo, err.code))
 

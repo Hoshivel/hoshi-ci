@@ -27,6 +27,10 @@ on:
         description: Report eligible work without dispatching.
         type: boolean
         default: false
+      pr:
+        description: Optional PR number within the selected repository.
+        required: false
+        type: string
 
 # 同時只有一次派工在跑；前一次還沒結束時，下一次排隊而不是重複派。
 concurrency:
@@ -56,5 +60,6 @@ jobs:
           # 本倉庫自己的：派 run、讀 run 清單。
           GH_TOKEN: ${{ github.token }}
           MANUAL_REPO: ${{ inputs.repo }}
+          MANUAL_PR: ${{ inputs.pr }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: python3 tools/dispatch.py
