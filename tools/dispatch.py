@@ -165,7 +165,7 @@ def admit(repo: str, sha: str) -> int:
         raise ValueError("invalid worker identity")
     own = os.environ["GITHUB_REPOSITORY"]
     owner = own.split("/")[0]
-    if own != f"{owner}/hoshi-ci" or os.environ.get("GITHUB_REF_NAME") != DEFAULT_BRANCH:
+    if own != f"{owner}/hoshi-ci" or os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("worker requires its default branch")
     allowed = sha in {value for _, value in branch_heads(owner, repo, os.environ["SOURCE_TOKEN"])}
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
@@ -189,7 +189,7 @@ def dispatch() -> int:
 
     heads: dict[str, list[tuple[str, str]]] = {}
     unreadable: list[tuple[str, int]] = []
-    if ref != DEFAULT_BRANCH:
+    if ref != DEFAULT_BRANCH or os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("dispatcher requires its default branch")
     manual = os.environ.get("MANUAL_REPO", "")
     manual_pr = os.environ.get("MANUAL_PR", "")
