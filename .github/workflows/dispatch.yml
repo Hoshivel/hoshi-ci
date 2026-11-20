@@ -1,4 +1,4 @@
-# 派工：替還沒驗過的每個分支 head 派一次 `windows.yml`。
+# 派工：為尚未驗證的同倉 Ready PR 合併提交派一次 `windows.yml`。
 #
 # **只由排程與手動觸發。** 這支拿得到 HOSHIVEL_CI_TOKEN，而本倉庫是公開的：
 # `pull_request_target`、`workflow_run`、`issue_comment` 這類外人觸發得了的事件
@@ -18,6 +18,15 @@ on:
     # -R Hoshivel/hoshi-ci` 立刻派，已經派過的 commit 不會重派。
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
+    inputs:
+      repo:
+        description: Optional repository for a supervised pilot; empty uses enabled_windows.
+        required: false
+        type: string
+      dry_run:
+        description: Report eligible work without dispatching.
+        type: boolean
+        default: false
 
 # 同時只有一次派工在跑；前一次還沒結束時，下一次排隊而不是重複派。
 concurrency:
@@ -46,4 +55,6 @@ jobs:
           SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
           # 本倉庫自己的：派 run、讀 run 清單。
           GH_TOKEN: ${{ github.token }}
+          MANUAL_REPO: ${{ inputs.repo }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: python3 tools/dispatch.py

@@ -9,6 +9,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   workflow_dispatch:
 
 # 同一個 PR 上再推一次就取消前一次；`main` 不取消。
@@ -21,6 +22,7 @@ permissions:
 
 jobs:
   verify:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: 驗證
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -44,6 +46,7 @@ jobs:
 
   # 本倉庫是公開的，掃描不必等 `verify`，同時起跑。
   security:
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     name: 安全掃描
     uses: ./.github/workflows/security.yml
     permissions:

@@ -39,8 +39,27 @@ permissions:
   contents: read
 
 jobs:
+  eligibility:
+    name: Ready PR admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: check
+        env:
+          SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
+          REPO: ${{ inputs.repo }}
+          SHA: ${{ inputs.sha }}
+        run: python3 tools/dispatch.py admit --repo "$REPO" --sha "$SHA"
+
   verify:
     name: verify-windows
+    needs: eligibility
+    if: needs.eligibility.outputs.allowed == 'true'
     runs-on: windows-latest
     # 被驗證 job 自己的 timeout-minutes 由 run-job.py 執行；這裡是整個 job 的上限，
     # 多出來的是 checkout、setup-go 與 module 下載。
@@ -61,9 +80,18 @@ jobs:
           SHA: ${{ inputs.sha }}
         run: python ci/tools/dispatch.py check --repo "${REPO}" --sha "${SHA}"
 
+      - name: Recheck Ready PR before source checkout
+        id: current
+        env:
+          SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
+          REPO: ${{ inputs.repo }}
+          SHA: ${{ inputs.sha }}
+        run: python ci/tools/dispatch.py admit --repo "$REPO" --sha "$SHA"
+
       # 不用 actions/checkout：它會把 commit 標題印進日誌（`HEAD is now at …`），而那是
       # 私有倉庫的內容。這裡自己 fetch，全部帶 -q；憑證的帶法與下載 module 那一步相同。
       - name: 取得被驗證的 commit
+        if: steps.current.outputs.allowed == 'true'
         env:
           TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
           OWNER: ${{ github.repository_owner }}
@@ -80,18 +108,27 @@ jobs:
           export GIT_CONFIG_VALUE_0="https://github.com/"
           git init -q src
           git -C src remote add origin "https://github.com/${OWNER}/${REPO}"
-          git -C src fetch -q --depth=1 --no-tags origin "${SHA}"
-          git -C src -c advice.detachedHead=false checkout -q FETCH_HEAD
+          if ! git -C src fetch -q --depth=1 --no-tags origin "${SHA}" > "${RUNNER_TEMP}/source-fetch.log" 2>&1; then
+            echo "::error::Source fetch failed; private output withheld"
+            exit 1
+          fi
+          if ! git -C src -c advice.detachedHead=false checkout -q FETCH_HEAD > "${RUNNER_TEMP}/source-checkout.log" 2>&1; then
+            echo "::error::Source checkout failed; private output withheld"
+            exit 1
+          fi
           test "$(git -C src rev-parse HEAD)" = "${SHA}"
 
       - name: 安裝 PyYAML
+        if: steps.current.outputs.allowed == 'true'
         run: python -m pip install --disable-pip-version-check --quiet pyyaml==6.0.3
 
       - name: 讀 verify-windows 的定義
         id: plan
+        if: steps.current.outputs.allowed == 'true'
         run: python ci/tools/run-job.py plan --src src --output "${GITHUB_OUTPUT}"
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: steps.current.outputs.allowed == 'true'
         with:
           go-version-file: src/${{ steps.plan.outputs.go-version-file }}
           # 本倉庫是公開的，fork 的 PR 讀得到預設分支的快取，而這份快取會是私有倉庫的
@@ -102,6 +139,7 @@ jobs:
       # 行程裡：不寫 `~/.gitconfig`，這一步結束它就不存在了。GOPRIVATE 也只放在這一步——
       # 之後的步驟用被驗證 job 自己的 env，與它在私有倉庫跑時一樣。
       - name: 下載 module
+        if: steps.current.outputs.allowed == 'true'
         env:
           TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
           GOPRIVATE: github.com/hoshivel/*
@@ -117,11 +155,10 @@ jobs:
           export GIT_CONFIG_VALUE_0="https://github.com/"
           cd "${MODULE_DIR}"
           if ! go mod download > "${RUNNER_TEMP}/mod-download.log" 2>&1; then
-            # 只印 go 自己的錯誤行，並拿掉 URL 裡的帳密。
-            grep -E '^go: ' "${RUNNER_TEMP}/mod-download.log" | sed -E 's#://[^/@]*@#://#g' | head -20 || true
-            echo "::error::go mod download 失敗"
+            echo "::error::Module download failed; private output withheld"
             exit 1
           fi
 
       - name: verify-windows
+        if: steps.current.outputs.allowed == 'true'
         run: python ci/tools/run-job.py run --src src
