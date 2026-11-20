@@ -2,17 +2,18 @@
 #
 # 由 `dispatch.yml` 派出，也可手動：
 #
-#   gh workflow run windows.yml -R Hoshivel/hoshi-ci -f repo=<倉庫> -f sha=<40 字元 commit>
+#   gh workflow run windows.yml -R Hoshivel/hoshi-ci -f repo=<倉庫> -f pr=<PR 編號> \
+#     -f sha=<PR head> -f base=<已凍結 base> -f merge=<已凍結合併提交>
 #
 # **不在這裡重列指令。** `tools/run-job.py` 讀那個 commit 的 `.github/workflows/ci.yml`，
 # 取出 `verify-windows` 照步驟執行；私有倉庫改了那個 job，這裡跑的就跟著改。
 #
-# **token 出現在哪裡。** HOSHIVEL_CI_TOKEN 只交給兩步：取得 commit 與 `go mod download`，
-# 都以 GIT_CONFIG_* 行程環境變數帶入 insteadOf，不寫進任何設定檔。被驗證的程式碼與它的
-# 相依在那之後才執行，拿不到它。
+# **token 出現在哪裡。** HOSHIVEL_CI_TOKEN 用於來源準入、取得 commit 與 `go mod download`。
+# 後兩處以 GIT_CONFIG_* 行程環境變數帶入 insteadOf，不寫進任何設定檔。
+# 被驗證的程式碼與它的相依在那之後才執行，拿不到它。
 #
-# **公開日誌裡有什麼。** 本倉庫是公開的：倉庫名、commit 與每一步的成敗；失敗的那一步只印
-# 失敗的測試、套件與工具鏈錯誤。不開快取——fork 的 PR 讀得到預設分支的快取；不上傳 artifact。
+# **公開日誌裡有什麼。** 本倉庫是公開的：倉庫名、commit、Step 編號、成敗與時間。
+# 私有步驟名稱、原始碼、測試及工具鏈輸出不公開。不開快取；不上傳 artifact。
 name: Windows
 run-name: Windows ${{ inputs.repo }}@${{ inputs.sha }}
 
@@ -26,11 +27,23 @@ on:
         required: true
         type: string
       sha:
-        description: 40 字元的 commit SHA
+        description: 40 字元的 PR head SHA（派工去重身分）
+        required: true
+        type: string
+      base:
+        description: 凍結時的 40 字元 main base SHA
+        required: true
+        type: string
+      merge:
+        description: 凍結時的 40 字元合併 SHA（實際驗證的樹）
+        required: true
+        type: string
+      pr:
+        description: 來源倉庫的 Ready PR 編號
         required: true
         type: string
 
-# 同一個 commit 同時只跑一次。
+# 同一個 PR head 同時只跑一次；base 前進不建立另一份派工。
 concurrency:
   group: windows-${{ inputs.repo }}-${{ inputs.sha }}
   cancel-in-progress: false
@@ -54,7 +67,10 @@ jobs:
           SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
           REPO: ${{ inputs.repo }}
           SHA: ${{ inputs.sha }}
-        run: python3 tools/dispatch.py admit --repo "$REPO" --sha "$SHA"
+          BASE: ${{ inputs.base }}
+          MERGE: ${{ inputs.merge }}
+          PR: ${{ inputs.pr }}
+        run: python3 tools/dispatch.py admit --repo "$REPO" --sha "$SHA" --base "$BASE" --merge "$MERGE" --pr "$PR"
 
   verify:
     name: verify-windows
@@ -78,7 +94,10 @@ jobs:
         env:
           REPO: ${{ inputs.repo }}
           SHA: ${{ inputs.sha }}
-        run: python ci/tools/dispatch.py check --repo "${REPO}" --sha "${SHA}"
+          BASE: ${{ inputs.base }}
+          MERGE: ${{ inputs.merge }}
+          PR: ${{ inputs.pr }}
+        run: python ci/tools/dispatch.py check --repo "$REPO" --sha "$SHA" --base "$BASE" --merge "$MERGE" --pr "$PR"
 
       - name: Recheck Ready PR before source checkout
         id: current
@@ -86,7 +105,10 @@ jobs:
           SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
           REPO: ${{ inputs.repo }}
           SHA: ${{ inputs.sha }}
-        run: python ci/tools/dispatch.py admit --repo "$REPO" --sha "$SHA"
+          BASE: ${{ inputs.base }}
+          MERGE: ${{ inputs.merge }}
+          PR: ${{ inputs.pr }}
+        run: python ci/tools/dispatch.py admit --repo "$REPO" --sha "$SHA" --base "$BASE" --merge "$MERGE" --pr "$PR"
 
       # 不用 actions/checkout：它會把 commit 標題印進日誌（`HEAD is now at …`），而那是
       # 私有倉庫的內容。這裡自己 fetch，全部帶 -q；憑證的帶法與下載 module 那一步相同。
@@ -96,11 +118,11 @@ jobs:
           TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ inputs.repo }}
-          SHA: ${{ inputs.sha }}
+          SHA: ${{ inputs.merge }}
         run: |
           set -euo pipefail
           if [ -z "${TOKEN}" ]; then
-            echo "::error::缺少 HOSHIVEL_CI_TOKEN。它是 organization secret，本倉庫要在它的可見範圍內；權限只需要 Contents: Read-only。"
+            echo "::error::缺少 HOSHIVEL_CI_TOKEN。本倉庫須可讀此 organization secret；來源準入需要 Contents: read 與 Pull requests: read。"
             exit 1
           fi
           export GIT_CONFIG_COUNT=1
@@ -147,7 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${TOKEN}" ]; then
-            echo "::error::缺少 HOSHIVEL_CI_TOKEN。它是 organization secret，本倉庫要在它的可見範圍內；權限只需要 Contents: Read-only。"
+            echo "::error::缺少 HOSHIVEL_CI_TOKEN。本倉庫須可讀此 organization secret；來源準入需要 Contents: read 與 Pull requests: read。"
             exit 1
           fi
           export GIT_CONFIG_COUNT=1
