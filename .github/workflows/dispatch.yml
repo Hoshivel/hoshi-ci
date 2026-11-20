@@ -1,4 +1,4 @@
-# 派工：為尚未驗證的同倉 Ready PR 合併提交派一次 `windows.yml`。
+# 派工：每個新的同倉 Ready PR head 凍結合併提交，派一次 `windows.yml`。
 #
 # **只由排程與手動觸發。** 這支拿得到 HOSHIVEL_CI_TOKEN，而本倉庫是公開的：
 # `pull_request_target`、`workflow_run`、`issue_comment` 這類外人觸發得了的事件
@@ -15,7 +15,7 @@ on:
     # **排程不保證準時，也不保證馬上開始。** 本倉庫 2026-09-26 15:39Z 加上這一行，之後
     # 一個多小時裡六格都沒有觸發，而手動觸發照常；GitHub 社群有同樣的回報，新倉庫的排程
     # 過了約兩天才開始觸發。所以等結果的人不必等排程：手動 `gh workflow run dispatch.yml
-    # -R Hoshivel/hoshi-ci` 立刻派，已經派過的 commit 不會重派。
+    # -R Hoshivel/hoshi-ci` 立刻派，已經派過的 PR head 不會因 base 前進而重派。
     - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
@@ -53,9 +53,9 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: 列分支 head 並派工
+      - name: 列 Ready PR head 並派工
         env:
-          # 唯讀：只用來列被驗證倉庫的分支。
+          # 唯讀：核對來源 PR 與合併提交，需要 Contents 與 Pull requests: read。
           SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
           # 本倉庫自己的：派 run、讀 run 清單。
           GH_TOKEN: ${{ github.token }}

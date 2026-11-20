@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""為尚未驗證的 Ready PR 合併提交派一次 Windows 驗證。
+"""為新的 Ready PR head 凍結合併提交並派一次 Windows 驗證。
 
 由本倉庫的排程觸發。被驗證的倉庫是私有的，而且不持有任何指向這裡的憑證：
 hoshi-ci 主動去拉，沒有人往這裡推。
 
 對 `targets.json` 的 `windows` 清單裡每個倉庫，以 HOSHIVEL_CI_TOKEN（唯讀）列出
-同倉 Ready PR 的精確合併提交，丟掉已經有 `windows.yml` run 的 SHA（不論結果），其餘每個 SHA
+同倉 Ready PR 的 head、base 與合併提交，丟掉已經有 `windows.yml` run 的 head（不論結果），其餘每個 head
 以本倉庫自己的 GITHUB_TOKEN 派一個 run。run 的標題是 `Windows <倉庫>@<sha>`，
-這個標題就是「跑過什麼」的唯一記錄，別處沒有狀態。
+這個標題記錄已派出的 head。base 單獨前進不另派工；工作驗證已凍結的合併樹。
 
 分支名只讀不印：日誌只寫倉庫與 commit。
 
 用法：
   dispatch.py                         派工（需要 SOURCE_TOKEN、GH_TOKEN、GITHUB_REPOSITORY）
-  dispatch.py check --repo R --sha S  檢查 windows.yml 的輸入是否合法
+  dispatch.py check --repo R --sha H --base B --merge M --pr N  檢查工作身分
   dispatch.py selftest                只跑內建案例
 
 只用標準庫。
@@ -22,6 +22,7 @@ hoshi-ci 主動去拉，沒有人往這裡推。
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -48,6 +49,24 @@ MAX_DISPATCH = 2
 RUN_PAGES = 100
 
 
+@dataclass(frozen=True)
+class Candidate:
+    repository: str
+    number: int
+    head: str
+    base: str
+    merge: str
+
+    def inputs(self) -> dict[str, str]:
+        return {"repo": self.repository, "pr": str(self.number), "sha": self.head,
+                "base": self.base, "merge": self.merge}
+
+
+class SourceReadError(Exception):
+    def __init__(self, status: int):
+        self.status = status
+
+
 def title(repo: str, sha: str) -> str:
     return f"Windows {repo}@{sha}"
 
@@ -67,28 +86,28 @@ def load_targets(path: Path = TARGETS, *, enabled: bool = False) -> list[str]:
     return active
 
 
-def check(repo: str, sha: str, path: Path = TARGETS) -> str | None:
+def check(repo: str, sha: str, base: str, merge: str, pr: str,
+          path: Path = TARGETS) -> str | None:
     """Return the reason the inputs are rejected, or None."""
     if repo not in load_targets(path):
-        return f"{repo!r} 不在 {path.name} 的 windows 清單"
-    if not SHA.match(sha):
-        return "sha 必須是 40 字元的小寫十六進位"
+        return "repository is not in the Windows allowlist"
+    if not all(isinstance(value, str) and SHA.fullmatch(value) for value in (sha, base, merge)):
+        return "head, base and merge must be 40 lowercase hexadecimal characters"
+    if not isinstance(pr, str) or not pr.isascii() or not pr.isdigit() or int(pr) < 1:
+        return "PR number must be positive"
     return None
 
 
-def select(heads: dict[str, list[tuple[str, str]]], seen: set[tuple[str, str]],
-           limit: int) -> tuple[list[tuple[str, str]], int]:
-    """Pick (repo, sha) pairs without a run: default branches first, each commit once."""
-    ordered = sorted(
-        (branch != DEFAULT_BRANCH, repo, sha)
-        for repo, branches in heads.items()
-        for branch, sha in branches
-    )
-    pending: list[tuple[str, str]] = []
-    for _, repo, sha in ordered:
-        key = (repo, sha)
-        if key not in seen and key not in pending:
-            pending.append(key)
+def select(candidates: list[Candidate], seen: set[tuple[str, str]],
+           limit: int) -> tuple[list[Candidate], int]:
+    """Select one immutable snapshot for each previously undispatched head."""
+    pending = []
+    selected = set(seen)
+    for candidate in sorted(candidates, key=lambda item: (item.repository, item.number, item.head)):
+        key = (candidate.repository, candidate.head)
+        if key not in selected:
+            pending.append(candidate)
+            selected.add(key)
     return pending[:limit], max(0, len(pending) - limit)
 
 
@@ -110,9 +129,22 @@ def api(method: str, path: str, token: str, body: dict | None = None):
     return json.loads(raw) if raw else None
 
 
+def source_api(path: str, token: str):
+    try:
+        return api("GET", path, token)
+    except urllib.error.HTTPError as error:
+        raise SourceReadError(error.code) from None
+
+
 def eligible(owner: str, repo: str, pr: dict) -> bool:
+    if not isinstance(pr, dict) or type(pr.get("number")) is not int or pr["number"] < 1:
+        return False
     source = f"{owner}/{repo}"
     head, base = pr.get("head") or {}, pr.get("base") or {}
+    if not isinstance(head, dict) or not isinstance(base, dict):
+        return False
+    if not isinstance(head.get("repo"), dict) or not isinstance(base.get("repo"), dict):
+        return False
     return (pr.get("state") == "open" and pr.get("draft") is False
             and (head.get("repo") or {}).get("full_name") == source
             and (base.get("repo") or {}).get("full_name") == source
@@ -121,25 +153,30 @@ def eligible(owner: str, repo: str, pr: dict) -> bool:
                     (head.get("sha"), base.get("sha"))))
 
 
-def branch_heads(owner: str, repo: str, token: str) -> list[tuple[str, str]]:
-    """Return Ready PR merge commits whose two parents match current metadata."""
+def ready_candidates(owner: str, repo: str, token: str, seen: set[tuple[str, str]],
+                     only_pr: int | None = None) -> list[Candidate]:
+    """Freeze new Ready heads using the merge commit GitHub currently reports."""
     result = []
     for page in range(1, 101):
-        batch = api("GET", f"/repos/{owner}/{repo}/pulls?state=open&per_page=100&page={page}", token)
+        batch = source_api(f"/repos/{owner}/{repo}/pulls?state=open&per_page=100&page={page}", token)
         if not isinstance(batch, list):
             raise ValueError("incomplete pull request collection")
         for item in batch:
             if not eligible(owner, repo, item):
                 continue
             number = item["number"]
-            pr = api("GET", f"/repos/{owner}/{repo}/pulls/{number}", token)
+            if (repo, item["head"]["sha"]) in seen or (only_pr is not None and number != only_pr):
+                continue
+            pr = source_api(f"/repos/{owner}/{repo}/pulls/{number}", token)
             merge = pr.get("merge_commit_sha", "")
             if not eligible(owner, repo, pr) or pr.get("mergeable") is not True or not SHA.fullmatch(merge or ""):
                 continue
-            commit = api("GET", f"/repos/{owner}/{repo}/commits/{merge}", token)
+            if (repo, pr["head"]["sha"]) in seen:
+                continue
+            commit = source_api(f"/repos/{owner}/{repo}/git/commits/{merge}", token)
             parents = [p["sha"] for p in commit.get("parents", [])]
             if commit.get("sha") == merge and parents == [pr["base"]["sha"], pr["head"]["sha"]]:
-                result.append((str(number), merge))
+                result.append(Candidate(repo, number, pr["head"]["sha"], pr["base"]["sha"], merge))
         if len(batch) < 100:
             return result
     raise ValueError("pull request collection exceeds the complete-scan bound")
@@ -159,18 +196,38 @@ def seen_runs(own_repo: str, token: str) -> set[tuple[str, str]]:
     raise ValueError("run history exceeds the complete-scan bound")
 
 
-def admit(repo: str, sha: str) -> int:
+def snapshot_current(owner: str, candidate: Candidate, token: str) -> bool:
+    """Keep the frozen merge while rejecting closed, drafted or changed heads."""
+    repo = candidate.repository
+    pr = source_api(f"/repos/{owner}/{repo}/pulls/{candidate.number}", token)
+    if not eligible(owner, repo, pr) or pr.get("number") != candidate.number or pr["head"]["sha"] != candidate.head:
+        return False
+    # A rewind or unrelated base changes the meaning of the frozen snapshot.
+    current_base = pr["base"]["sha"]
+    if current_base != candidate.base:
+        comparison = source_api(f"/repos/{owner}/{repo}/compare/{candidate.base}...{current_base}", token)
+        if (comparison.get("status") != "ahead" or
+                comparison.get("merge_base_commit", {}).get("sha") != candidate.base):
+            return False
+    elif pr.get("merge_commit_sha") != candidate.merge or pr.get("mergeable") is not True:
+        return False
+    commit = source_api(f"/repos/{owner}/{repo}/git/commits/{candidate.merge}", token)
+    return commit.get("sha") == candidate.merge and [p.get("sha") for p in commit.get("parents", [])] == [candidate.base, candidate.head]
+
+
+def admit(repo: str, sha: str, base: str, merge: str, pr: str) -> int:
     """Recheck before Windows allocation and again immediately before checkout."""
-    if check(repo, sha):
+    if check(repo, sha, base, merge, pr):
         raise ValueError("invalid worker identity")
     own = os.environ["GITHUB_REPOSITORY"]
     owner = own.split("/")[0]
     if own != f"{owner}/hoshi-ci" or os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("worker requires its default branch")
-    allowed = sha in {value for _, value in branch_heads(owner, repo, os.environ["SOURCE_TOKEN"])}
+    candidate = Candidate(repo, int(pr), sha, base, merge)
+    allowed = snapshot_current(owner, candidate, os.environ["SOURCE_TOKEN"])
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write("allowed=" + str(allowed).lower() + "\n")
-    print("Ready PR merge verified" if allowed else "Source changed or PR is not Ready; no source work")
+    print("Ready PR head and frozen merge verified" if allowed else "Source changed or PR is not Ready; no source work")
     return 0 if allowed else 1
 
 
@@ -181,13 +238,13 @@ def dispatch() -> int:
     owner = os.environ.get("GITHUB_REPOSITORY_OWNER", "") or own_repo.split("/")[0]
     ref = os.environ.get("GITHUB_REF_NAME", "") or DEFAULT_BRANCH
     if not source:
-        print("::error::缺少 HOSHIVEL_CI_TOKEN。它是 organization secret，本倉庫要在它的可見範圍內；權限只需要 Contents: Read-only。")
+        print("::error::缺少 HOSHIVEL_CI_TOKEN。本倉庫必須可讀此 organization secret，且它須具備來源倉庫的 Contents: read 與 Pull requests: read。")
         return 1
     if not own or not own_repo:
         print("::error::缺少 GH_TOKEN 或 GITHUB_REPOSITORY；這支只在 Actions 裡跑。")
         return 1
 
-    heads: dict[str, list[tuple[str, str]]] = {}
+    candidates: list[Candidate] = []
     unreadable: list[tuple[str, int]] = []
     if ref != DEFAULT_BRANCH or os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("dispatcher requires its default branch")
@@ -198,57 +255,61 @@ def dispatch() -> int:
     selected = [manual] if manual else load_targets(enabled=True)
     if manual and manual not in load_targets():
         raise ValueError("manual target is not allowed")
+    seen = seen_runs(own_repo, own)
     for repo in selected:
         try:
-            heads[repo] = branch_heads(owner, repo, source)
-            if manual_pr:
-                heads[repo] = [(number, sha) for number, sha in heads[repo] if number == manual_pr]
-        except urllib.error.HTTPError as err:
-            unreadable.append((repo, err.code))
-
-    seen = seen_runs(own_repo, own)
-    chosen, deferred = select(heads, seen, MAX_DISPATCH)
+            candidates += ready_candidates(owner, repo, source, seen, int(manual_pr) if manual_pr else None)
+        except SourceReadError as err:
+            unreadable.append((repo, err.status))
+    chosen, deferred = select(candidates, seen, MAX_DISPATCH)
     dry_run = os.environ.get("DRY_RUN", "false") == "true"
-    for repo, sha in chosen:
+    for candidate in chosen:
         if dry_run:
-            print(f"Selected {repo}@{sha}")
+            print(f"Selected {candidate.repository}@{candidate.head}")
             continue
         api("POST", f"/repos/{own_repo}/actions/workflows/{WORKFLOW}/dispatches", own,
-            {"ref": ref, "inputs": {"repo": repo, "sha": sha}})
-        print(f"派出 {repo}@{sha[:12]}")
+            {"ref": ref, "inputs": candidate.inputs()})
+        print(f"Dispatched {candidate.repository}@{candidate.head[:12]}")
 
-    total = sum(len(v) for v in heads.values())
-    print(f"repos={len(heads)} ready-merges={total} selected={len(chosen)} deferred={deferred} dry-run={dry_run}")
+    print(f"repos={len(selected) - len(unreadable)} new-ready-heads={len(candidates)} selected={len(chosen)} deferred={deferred} dry-run={dry_run}")
     for repo, code in unreadable:
-        print(f"::error::讀不到 {owner}/{repo} 的分支（HTTP {code}）。HOSHIVEL_CI_TOKEN 的 Repository access "
-              "要包含它，權限 Contents: Read-only。私有倉庫讀不到時回的是 404，不是 403。")
+        print(f"::error::Cannot read {owner}/{repo} Ready PR metadata (HTTP {code}). "
+              "HOSHIVEL_CI_TOKEN needs repository access with Contents: read and Pull requests: read.")
     return 1 if unreadable else 0
 
 
 def selftest() -> int:
-    a, b, c = "a" * 40, "b" * 40, "c" * 40
+    import contextlib
+    import copy
+    import io
+
+    a, b, c, d, e = (letter * 40 for letter in "abcde")
     assert TITLE.match(title("hoshi-data", a))["sha"] == a
     assert not TITLE.match(f"Windows hoshi-data@{a[:12]}")
     assert not TITLE.match(f"Windows hoshi-data@{a.upper()}")
-
-    heads = {
-        "r1": [("feature", a), (DEFAULT_BRANCH, b)],
-        "r2": [(DEFAULT_BRANCH, a), ("fresh", a), ("other", c)],
-    }
-    chosen, deferred = select(heads, set(), 10)
-    # Default branches first; a commit shared by two branches of one repo once.
-    assert chosen == [("r1", b), ("r2", a), ("r1", a), ("r2", c)], chosen
+    frozen = Candidate("hoshi-data", 7, a, b, c)
+    rebased_snapshot = Candidate("hoshi-data", 7, a, d, e)
+    next_head = Candidate("hoshi-data", 7, d, b, e)
+    other_repo = Candidate("hoshi-svc", 2, a, b, c)
+    candidates = [frozen, rebased_snapshot, next_head, other_repo]
+    chosen, deferred = select(candidates, set(), 10)
+    assert chosen == [frozen, next_head, other_repo], chosen
     assert deferred == 0
-    chosen, deferred = select(heads, {("r1", b), ("r2", c)}, 1)
-    assert chosen == [("r2", a)] and deferred == 1, (chosen, deferred)
+    chosen, deferred = select(candidates, {("hoshi-data", a)}, 1)
+    assert chosen == [next_head] and deferred == 1, (chosen, deferred)
+    assert frozen.inputs() == {"repo": "hoshi-data", "pr": "7", "sha": a, "base": b, "merge": c}
 
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp) / "targets.json"
         path.write_text(json.dumps({"windows": ["hoshi-data", "hoshi-svc"]}), encoding="utf-8")
-        assert check("hoshi-data", a, path) is None
-        assert check("hoshi-ci", a, path)
-        assert check("hoshi-data", a[:12], path)
-        assert check("hoshi-data", a.upper(), path)
+        assert check("hoshi-data", a, b, c, "7", path) is None
+        assert check("hoshi-ci", a, b, c, "7", path)
+        for bad in (a[:12], a.upper(), "x" * 40, "", "\n" + a):
+            assert check("hoshi-data", bad, b, c, "7", path)
+            assert check("hoshi-data", a, bad, c, "7", path)
+            assert check("hoshi-data", a, b, bad, "7", path)
+        for bad in ("0", "-1", "", "1;echo", "１"):
+            assert check("hoshi-data", a, b, c, bad, path)
         for bad in ({"windows": []}, {"windows": ["x", "x"]}, {"windows": ["../x"]}, {}):
             path.write_text(json.dumps(bad), encoding="utf-8")
             try:
@@ -258,10 +319,11 @@ def selftest() -> int:
             raise AssertionError(f"應該拒絕：{bad}")
 
     load_targets()  # the real list parses
-    import copy
     pr = {"state": "open", "draft": False, "number": 7,
+          "mergeable": True, "merge_commit_sha": c,
           "head": {"sha": a, "repo": {"full_name": "Hoshivel/hoshi-data"}},
           "base": {"sha": b, "ref": "main", "repo": {"full_name": "Hoshivel/hoshi-data"}}}
+    original = copy.deepcopy(pr)
     assert eligible("Hoshivel", "hoshi-data", pr)
     for key, value in (("draft", True), ("state", "closed")):
         bad = copy.deepcopy(pr); bad[key] = value
@@ -270,21 +332,103 @@ def selftest() -> int:
     assert not eligible("Hoshivel", "hoshi-data", bad)
     bad = copy.deepcopy(pr); bad["base"]["ref"] = "other"
     assert not eligible("Hoshivel", "hoshi-data", bad)
+    for malformed in (None, [], {}, {**pr, "number": True}, {**pr, "head": []}, {**pr, "base": {"repo": None}}):
+        assert not eligible("Hoshivel", "hoshi-data", malformed)
     global api
     saved = api
+    calls = []
+    dispatched = []
+    history = []
+    source_error = None
+    commit = {"sha": c, "parents": [{"sha": b}, {"sha": a}]}
+    comparison = {"status": "ahead", "merge_base_commit": {"sha": b}}
     def fake(method, path, token, body=None):
+        calls.append((method, path))
+        if method == "POST":
+            assert path == "/repos/Hoshivel/hoshi-ci/actions/workflows/windows.yml/dispatches"
+            dispatched.append(body)
+            return None
+        if "/actions/workflows/" in path:
+            return {"workflow_runs": history}
+        if source_error:
+            raise urllib.error.HTTPError(path, source_error, "private response body", {}, None)
         if "pulls?" in path:
             return [pr]
         if "/pulls/" in path:
-            return {**pr, "mergeable": True, "merge_commit_sha": c}
-        return {"sha": c, "parents": [{"sha": b}, {"sha": a}]}
+            return pr
+        if "/git/commits/" in path:
+            assert path.endswith(c)
+            return commit
+        if "/compare/" in path:
+            return comparison
+        raise AssertionError("unexpected API path")
+    saved_environment = dict(os.environ)
     try:
         api = fake
-        assert branch_heads("Hoshivel", "hoshi-data", "unused") == [("7", c)]
-        pr["base"]["sha"] = c
-        assert branch_heads("Hoshivel", "hoshi-data", "unused") == []
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", set()) == [frozen]
+        assert snapshot_current("Hoshivel", frozen, "unused")
+        calls.clear()
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", {("hoshi-data", a)}) == []
+        assert len(calls) == 1, "known heads must not resolve a new merge"
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", set(), 8) == []
+
+        # A normal base advance preserves the frozen merge, without redispatch.
+        pr["base"]["sha"] = d
+        pr["merge_commit_sha"] = e
+        assert snapshot_current("Hoshivel", frozen, "unused")
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", {("hoshi-data", a)}) == []
+        comparison["status"] = "behind"
+        assert not snapshot_current("Hoshivel", frozen, "unused")
+        comparison["status"] = "ahead"
+        comparison["merge_base_commit"]["sha"] = e
+        assert not snapshot_current("Hoshivel", frozen, "unused")
+        comparison["merge_base_commit"]["sha"] = b
+        pr = copy.deepcopy(original)
+        for key, value in (("draft", True), ("state", "closed"), ("number", 8), ("mergeable", None), ("merge_commit_sha", e)):
+            pr[key] = value
+            assert not snapshot_current("Hoshivel", frozen, "unused")
+            pr = copy.deepcopy(original)
+        for section, key, value in (("head", "sha", d), ("base", "ref", "other")):
+            pr[section][key] = value
+            assert not snapshot_current("Hoshivel", frozen, "unused")
+            pr = copy.deepcopy(original)
+        pr["head"]["repo"]["full_name"] = "outside/hoshi-data"
+        assert not snapshot_current("Hoshivel", frozen, "unused")
+        pr = copy.deepcopy(original)
+        commit["parents"].reverse()
+        assert not snapshot_current("Hoshivel", frozen, "unused")
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", set()) == []
+        commit["parents"].reverse()
+
+        os.environ.update({"GITHUB_REPOSITORY": "Hoshivel/hoshi-ci", "GITHUB_REPOSITORY_OWNER": "Hoshivel",
+                           "GITHUB_REF": "refs/heads/main", "GITHUB_REF_NAME": "main",
+                           "SOURCE_TOKEN": "source", "GH_TOKEN": "own", "MANUAL_REPO": "hoshi-data",
+                           "MANUAL_PR": "7", "DRY_RUN": "false"})
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as output:
+            os.environ["GITHUB_OUTPUT"] = str(Path(tmp) / "output")
+            assert admit("hoshi-data", a, b, c, "7") == 0
+            pr["draft"] = True
+            assert admit("hoshi-data", a, b, c, "7") == 1
+            assert Path(os.environ["GITHUB_OUTPUT"]).read_text() == "allowed=true\nallowed=false\n"
+            pr = copy.deepcopy(original)
+            assert dispatch() == 0
+            assert dispatched == [{"ref": "main", "inputs": frozen.inputs()}]
+            history[:] = [{"display_title": title("hoshi-data", a), "conclusion": "failure"}]
+            assert dispatch() == 0
+            assert len(dispatched) == 1, "failed admissions require explicit retry"
+            history.clear()
+            os.environ["DRY_RUN"] = "true"
+            assert dispatch() == 0
+            assert len(dispatched) == 1
+            source_error = 403
+            assert dispatch() == 1
+            assert main(["admit", "--repo", "hoshi-data", "--sha", a, "--base", b, "--merge", c, "--pr", "7"]) == 1
+            assert "Pull requests: read" in output.getvalue()
+            assert "private response body" not in output.getvalue()
     finally:
         api = saved
+        os.environ.clear()
+        os.environ.update(saved_environment)
     print("dispatch.py selftest：全部通過")
     return 0
 
@@ -296,27 +440,28 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = parser.add_subparsers(dest="mode")
-    checker = sub.add_parser("check")
-    checker.add_argument("--repo", required=True)
-    checker.add_argument("--sha", required=True)
-    admission = sub.add_parser("admit")
-    admission.add_argument("--repo", required=True)
-    admission.add_argument("--sha", required=True)
+    for mode in ("check", "admit"):
+        command = sub.add_parser(mode)
+        for argument in ("repo", "sha", "base", "merge", "pr"):
+            command.add_argument(f"--{argument}", required=True)
     sub.add_parser("selftest")
     args = parser.parse_args(argv)
 
     if args.mode == "selftest":
         return selftest()
     if args.mode == "check":
-        reason = check(args.repo, args.sha)
+        reason = check(args.repo, args.sha, args.base, args.merge, args.pr)
         if reason:
             print(f"::error::{reason}")
             return 1
         return 0
     try:
         if args.mode == "admit":
-            return admit(args.repo, args.sha)
+            return admit(args.repo, args.sha, args.base, args.merge, args.pr)
         return dispatch()
+    except SourceReadError as error:
+        print(f"::error::Source Ready PR metadata could not be read (HTTP {error.status}). "
+              "HOSHIVEL_CI_TOKEN needs repository access with Contents: read and Pull requests: read.")
     except urllib.error.HTTPError as error:
         print(f"::error::GitHub API rejected the operation (HTTP {error.code})")
     except (KeyError, ValueError, urllib.error.URLError):
