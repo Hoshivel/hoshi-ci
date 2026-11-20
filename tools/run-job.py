@@ -11,14 +11,13 @@ action 一律是錯誤，不是跳過：一個安靜沒跑的步驟，與一個�
 唯一的例外是私有 module 憑證那一步：它由 workflow 自己的下載步驟代替，而那是唯一
 看得到 token 的步驟。被驗證的程式碼開始執行時，token 已經不在了。
 
-輸出被收下而不是直接印出。本倉庫是公開的，所以日誌只印每一步的成敗，失敗的那一步
-也只印點名失敗對象的行（測試、套件、工具鏈錯誤）。完整輸出留在 runner 上，要看就在
-開發機以同一個 commit 重跑。
+輸出被收下而不是直接印出。本倉庫是公開的，日誌僅含步驟序號、成敗、結束碼與時間。
+步驟名稱、命令及完整輸出留在 runner 上，要看就在開發機以同一個 commit 重跑。
 
 用法：
   run-job.py plan --src DIR [--output FILE]
                               驗證 job 形狀，把 go-version-file 與 module-dir
-                              以 key=value 附加到 FILE（預設印在 stdout）
+                              以 key=value 附加到 FILE，stdout 只報形狀通過
   run-job.py run  --src DIR   執行 run 步驟
   run-job.py selftest         只跑內建案例
 """
@@ -26,8 +25,11 @@ action 一律是錯誤，不是跳過：一個安靜沒跑的步驟，與一個�
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -40,7 +42,7 @@ WORKFLOW = ".github/workflows/ci.yml"
 JOB = "verify-windows"
 RUNS_ON = "windows-latest"
 
-JOB_KEYS = {"if", "name", "runs-on", "timeout-minutes", "env", "defaults", "steps"}
+JOB_KEYS = {"if", "name", "needs", "runs-on", "timeout-minutes", "env", "defaults", "steps"}
 STEP_KEYS = {"name", "id", "run", "uses", "with", "env", "shell", "working-directory"}
 SHELLS = {"bash", "pwsh"}
 # The shell GitHub uses on Windows when neither the step nor `defaults` names one.
@@ -49,12 +51,6 @@ DEFAULT_SHELL = "pwsh"
 DEFAULT_TIMEOUT = 360
 
 CREDENTIAL = re.compile(r"\$\{\{\s*secrets\.HOSHIVEL_CI_TOKEN\s*\}\}")
-
-# The only lines of a failing step that reach the public log: which test or
-# package failed, and toolchain or workflow errors. Never source text,
-# assertion messages or test output.
-SHOWN = re.compile(r"^(?:\s*--- FAIL: |FAIL(?:\s|$)|# |go: |::error)")
-SHOWN_LIMIT = 60
 
 # File commands the runner reads after a step. A child process must not be
 # able to write this job's summary, outputs, env or path, so each gets a
@@ -104,18 +100,12 @@ def relative(where: str, value: object) -> str:
     if not isinstance(value, str) or not value.strip():
         raise JobError(f"{where} 必須是非空字串")
     literal(where, value)
+    if not re.fullmatch(r"[A-Za-z0-9._/\\-]+", value):
+        raise JobError("relative path contains unsupported characters")
     path = PurePosixPath(value.replace("\\", "/"))
     if path.is_absolute() or ".." in path.parts or re.match(r"^[A-Za-z]:", value):
         raise JobError(f"{where} 必須是倉庫內的相對路徑：{value!r}")
     return str(path)
-
-
-def label_of(step: dict, run: str) -> str:
-    name = step.get("name")
-    if name:
-        return str(name)
-    first = next((line.strip() for line in run.splitlines() if line.strip()), "")
-    return first[:80]
 
 
 def build_plan(doc: dict, job_name: str = JOB) -> Plan:
@@ -128,6 +118,11 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
     unknown = set(job) - JOB_KEYS
     if unknown:
         raise JobError(f"job 有不認得的鍵：{', '.join(sorted(unknown))}")
+    # The dispatcher and worker admission independently bind an open Ready PR
+    # to this source. This dependency supplies no build outputs or services.
+    # No other prerequisite can be silently omitted by the portable runner.
+    if "needs" in job and job["needs"] != ["eligibility"]:
+        raise JobError("unsupported prerequisite job")
     if job.get("runs-on") != RUNS_ON:
         raise JobError(f"runs-on 是 {job.get('runs-on')!r}，這裡只跑 {RUNS_ON}")
     timeout = job.get("timeout-minutes", DEFAULT_TIMEOUT)
@@ -199,7 +194,7 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
             raise JobError(f"{where} 的 env 不是 mapping")
 
         if any(isinstance(v, str) and CREDENTIAL.search(v) for v in step_env.values()):
-            notes.append(f"{label_of(step, run)}：由 hoshi-ci 的 module 下載步驟代替")
+            notes.append("Module authentication is handled before source execution.")
             continue
 
         literal(f"{where} run", run)
@@ -214,7 +209,7 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
                        step.get("working-directory", defaults.get("working-directory", ".")))
 
         steps.append(Step(
-            label=label_of(step, run),
+            label=f"Step {len(steps) + 1}",
             shell=shell,
             script=run,
             env={str(k): env_value(v) for k, v in step_env.items()},
@@ -231,10 +226,14 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
 def load_plan(src: Path, workflow: str, job: str) -> Plan:
     import yaml  # installed, pinned, by the workflow step before this one
 
-    path = src / workflow
-    if not path.is_file():
+    path = src / relative("workflow", workflow)
+    if not path.is_file() or not path.resolve().is_relative_to(src.resolve()):
         raise JobError(f"{workflow} 不存在")
-    return build_plan(yaml.safe_load(path.read_text(encoding="utf-8")), job)
+    plan = build_plan(yaml.safe_load(path.read_text(encoding="utf-8")), job)
+    module = src / plan.go_version_file
+    if not module.is_file() or not module.resolve().is_relative_to(src.resolve()):
+        raise JobError("module file escapes or is absent from source")
+    return plan
 
 
 def git_bash() -> str:
@@ -277,35 +276,38 @@ def command(step: Step, scratch: Path, index: int) -> list[str]:
 
 def child_env(base: dict[str, str], plan: Plan, step: Step, src: Path, scratch: Path) -> dict[str, str]:
     env = dict(base)
+    env.update(plan.env)
+    env.update(step.env)
+    for name in tuple(env):
+        upper = name.upper()
+        if (upper in {"TOKEN", "SECRET", "PASSWORD", "GIT_ASKPASS", "SSH_ASKPASS", "SSH_AUTH_SOCK"}
+                or upper.endswith(("_TOKEN", "_SECRET", "_PASSWORD", "_KEY"))
+                or upper.startswith(("ACTIONS_", "GIT_CONFIG_"))):
+            del env[name]
     env["GITHUB_WORKSPACE"] = str(src.resolve())
     for name in FILE_COMMANDS:
         env[name] = str(scratch / f"discard-{name.lower()}")
-    env.update(plan.env)
-    env.update(step.env)
     return env
-
-
-def shown_lines(text: str) -> tuple[list[str], int]:
-    lines = text.splitlines()
-    shown = [line for line in lines if SHOWN.match(line)]
-    return shown[:SHOWN_LIMIT], len(lines) - min(len(shown), SHOWN_LIMIT)
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
     if os.name == "nt":
-        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        result = subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=30, check=False)
+        if result.returncode and proc.poll() is None:
+            raise JobError("process tree termination failed")
     else:
-        proc.kill()
-    proc.wait()
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    proc.wait(timeout=30)
 
 
 def execute(plan: Plan, src: Path) -> int:
     scratch = Path(os.environ.get("RUNNER_TEMP") or tempfile.gettempdir()) / "hoshi-ci-job"
     scratch.mkdir(parents=True, exist_ok=True)
-
-    for note in plan.notes:
-        print(f"· {note}")
 
     deadline = time.monotonic() + plan.timeout_minutes * 60
     base = dict(os.environ)
@@ -313,9 +315,10 @@ def execute(plan: Plan, src: Path) -> int:
     failed = False
 
     for index, step in enumerate(plan.steps, 1):
+        label = f"Step {index}"
         if failed:
-            rows.append((step.label, "未執行", ""))
-            print(f"- {step.label}  未執行")
+            rows.append((label, "Not run", ""))
+            print(f"{label}: not run")
             continue
 
         cwd = src / step.cwd
@@ -323,10 +326,10 @@ def execute(plan: Plan, src: Path) -> int:
         start = time.monotonic()
         code: int | None = None
         reason = ""
-        if not cwd.is_dir():
-            reason = f"working-directory {step.cwd} 不存在"
+        if not cwd.is_dir() or not cwd.resolve().is_relative_to(src.resolve()):
+            reason = "working directory unavailable"
         elif deadline - start <= 0:
-            reason = f"超過 timeout-minutes（{plan.timeout_minutes}）"
+            reason = "timeout"
         else:
             with log.open("wb") as out:
                 proc = subprocess.Popen(
@@ -336,30 +339,25 @@ def execute(plan: Plan, src: Path) -> int:
                     stdin=subprocess.DEVNULL,
                     stdout=out,
                     stderr=subprocess.STDOUT,
+                    start_new_session=os.name != "nt",
                 )
                 try:
                     code = proc.wait(timeout=deadline - start)
                 except subprocess.TimeoutExpired:
                     kill_tree(proc)
-                    reason = f"超過 timeout-minutes（{plan.timeout_minutes}）"
+                    reason = "timeout"
         elapsed = f"{time.monotonic() - start:.0f}s"
 
         if code == 0:
-            rows.append((step.label, "✓", elapsed))
-            print(f"✓ {step.label}  ({elapsed})")
+            rows.append((label, "Success", elapsed))
+            print(f"{label}: success ({elapsed})")
             continue
 
         failed = True
-        reason = reason or f"結束碼 {code}"
-        rows.append((step.label, f"✗ {reason}", elapsed))
-        print(f"✗ {step.label}  ({elapsed}，{reason})")
-        print(f"::error::{step.label}：{reason}")
-        if log.is_file():
-            shown, hidden = shown_lines(log.read_bytes().decode("utf-8", errors="replace"))
-            for line in shown:
-                print(f"    {line}")
-            if hidden:
-                print(f"    （另有 {hidden} 行不公開）")
+        reason = reason or f"exit {code}"
+        rows.append((label, reason, elapsed))
+        print(f"{label}: failure ({elapsed}, {reason})")
+        print(f"::error::{label} failed")
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
@@ -367,8 +365,7 @@ def execute(plan: Plan, src: Path) -> int:
             out.write(f"### {JOB}\n\n| 步驟 | 結果 | 時間 |\n|---|---|---|\n")
             for label, result, elapsed in rows:
                 out.write(f"| `{label}` | {result} | {elapsed} |\n")
-            out.write("\n完整輸出不公開。要看失敗的細節，在 Windows 開發機 checkout 同一個 commit，"
-                      "重跑失敗的那一步。\n")
+            out.write("\nDetailed output is withheld. Reproduce this source revision privately.\n")
     return 1 if failed else 0
 
 
@@ -407,11 +404,13 @@ def selftest() -> int:
     assert plan.module_dir == "backend", plan.module_dir
     assert plan.timeout_minutes == 25
     assert plan.env == {"GOPRIVATE": "github.com/hoshivel/*"}
-    assert [s.label for s in plan.steps] == ["go build ./...", "cross"], plan.steps
+    assert [s.label for s in plan.steps] == ["Step 1", "Step 2"], plan.steps
     assert [s.shell for s in plan.steps] == ["pwsh", "bash"]
     assert [s.cwd for s in plan.steps] == ["backend", "backend"]
     assert plan.steps[1].env == {"GOOS": "linux", "CGO_ENABLED": "0"}
-    assert len(plan.notes) == 1 and "私有 module 憑證" in plan.notes[0]
+    assert len(plan.notes) == 1
+    admitted = variant(lambda j: j.update({"needs": ["eligibility"]}))
+    assert build_plan(admitted).steps == plan.steps
 
     root = variant(lambda j: j["steps"][1]["with"].update({"go-version-file": "go.mod"}))
     assert build_plan(root).module_dir == "."
@@ -431,6 +430,11 @@ def selftest() -> int:
         "setup-go 在 run 之後": lambda j: j["steps"].append(j["steps"].pop(1)),
         "只剩憑證那一步": lambda j: j.update({"steps": j["steps"][:3]}),
         "timeout 不是整數": lambda j: j.update({"timeout-minutes": "25"}),
+        "其他前置工作": lambda j: j.update({"needs": ["build"]}),
+        "混合前置工作": lambda j: j.update({"needs": ["eligibility", "build"]}),
+        "未識別的前置型態": lambda j: j.update({"needs": "eligibility"}),
+        "步驟條件": lambda j: j["steps"][3].update({"if": "always()"}),
+        "輸出檔注入": lambda j: j["steps"][1]["with"].update({"go-version-file": "go.mod\nextra=value"}),
     }
     for what, mutate in rejected.items():
         try:
@@ -449,36 +453,68 @@ def selftest() -> int:
     assert wrapped.startswith("$ErrorActionPreference = 'stop'\n")
     assert wrapped.endswith("{ exit $LASTEXITCODE }\n")
 
-    output = "\n".join([
-        "=== RUN   TestA",
-        "    a_test.go:12: expected secret-looking value, got other",
-        "--- FAIL: TestA (0.00s)",
-        "    --- FAIL: TestA/sub (0.00s)",
-        "FAIL",
-        "FAIL\tgithub.com/hoshivel/x/internal/a\t0.123s",
-        "ok  \tgithub.com/hoshivel/x/internal/b\t0.1s",
-        "# github.com/hoshivel/x/internal/c",
-        "internal/c/c.go:3:2: undefined: token",
-        "go: downloading example.com/m v1.0.0",
-        "::error::a.ps1 語法錯誤",
-        "panic: runtime error",
-    ])
-    shown, hidden = shown_lines(output)
-    assert shown == [
-        "--- FAIL: TestA (0.00s)",
-        "    --- FAIL: TestA/sub (0.00s)",
-        "FAIL",
-        "FAIL\tgithub.com/hoshivel/x/internal/a\t0.123s",
-        "# github.com/hoshivel/x/internal/c",
-        "go: downloading example.com/m v1.0.0",
-        "::error::a.ps1 語法錯誤",
-    ], shown
-    assert hidden == 5, hidden
-
     scratch = Path(tempfile.gettempdir())
-    env = child_env({"GITHUB_STEP_SUMMARY": "real", "PATH": "p"}, plan, plan.steps[1], Path("."), scratch)
+    ambient = {"GITHUB_STEP_SUMMARY": "real", "PATH": "p", "SOURCE_TOKEN": "private",
+               "GITHUB_TOKEN": "private", "GH_TOKEN": "private", "TOKEN": "private",
+               "ACTIONS_RUNTIME_TOKEN": "private", "GIT_CONFIG_KEY_0": "private",
+               "SSH_AUTH_SOCK": "private", "GIT_ASKPASS": "private"}
+    env = child_env(ambient, plan, plan.steps[1], Path("."), scratch)
     assert env["GITHUB_STEP_SUMMARY"] != "real"
     assert env["GOOS"] == "linux" and env["GOPRIVATE"] == "github.com/hoshivel/*" and env["PATH"] == "p"
+    assert not any(value == "private" for value in env.values())
+    replacement = Step("private", "pwsh", "unused", {"GITHUB_OUTPUT": "outside", "GH_TOKEN": "private"}, ".")
+    env = child_env({}, plan, replacement, Path("."), scratch)
+    assert env["GITHUB_OUTPUT"] != "outside" and "GH_TOKEN" not in env
+
+    # Prefix allowlists cannot make arbitrary test output public. A child can
+    # print a private value after any accepted compiler/test/annotation prefix.
+    from unittest.mock import patch
+    private = "PRIVATE_OUTPUT_MUST_NOT_BE_PUBLISHED"
+    script = "import sys; print(" + repr("\n".join(prefix + private for prefix in (
+        "::error::", "# ", "go: ", "--- FAIL: Test/", "FAIL ", "::warning::"))) + "); sys.exit(17)"
+    with tempfile.TemporaryDirectory() as folder:
+        work = Path(folder)
+        summary = work / "summary.md"
+        public = io.StringIO()
+        sample = Plan("go.mod", 1, {}, [Step(private, "pwsh", private, {}, ".")])
+        with patch.dict(os.environ, {"RUNNER_TEMP": folder, "GITHUB_STEP_SUMMARY": str(summary)}), \
+             patch.object(sys.modules[__name__], "command", return_value=[sys.executable, "-c", script]), \
+             contextlib.redirect_stdout(public):
+            assert execute(sample, work) == 1
+        assert private not in public.getvalue() and private not in summary.read_text(encoding="utf-8")
+        assert "Step 1" in public.getvalue() and "exit 17" in public.getvalue()
+        assert private in (work / "hoshi-ci-job/step1.log").read_text()
+
+        invalid = work / ".github/workflows"
+        invalid.mkdir(parents=True)
+        (invalid / "ci.yml").write_text("jobs: [" + private, encoding="utf-8")
+        public = io.StringIO()
+        with contextlib.redirect_stdout(public):
+            assert main(["plan", "--src", str(work)]) == 1
+        assert private not in public.getvalue()
+
+        # A timed-out shell can leave a test server beneath it. Exercise the
+        # process-tree terminator with an owned parent and a live child writer.
+        heartbeat = work / "child-heartbeat"
+        child_script = ("import pathlib,time; p=pathlib.Path(" + repr(str(heartbeat)) + "); "
+                        "\nwhile True:\n p.write_text(str(time.monotonic())); time.sleep(.02)")
+        parent_script = ("import subprocess,sys,time; subprocess.Popen([sys.executable,'-c'," +
+                         repr(child_script) + "]); time.sleep(30)")
+        process = subprocess.Popen([sys.executable, "-c", parent_script],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=os.name != "nt")
+        try:
+            until = time.monotonic() + 5
+            while not heartbeat.exists() and time.monotonic() < until:
+                time.sleep(.02)
+            assert heartbeat.exists(), "owned child did not start"
+            kill_tree(process)
+            stopped = heartbeat.read_bytes()
+            time.sleep(.1)
+            assert heartbeat.read_bytes() == stopped, "descendant survived process-tree termination"
+        finally:
+            if process.poll() is None:
+                kill_tree(process)
 
     print("run-job.py selftest：全部通過")
     return 0
@@ -504,8 +540,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         plan = load_plan(args.src, args.workflow, args.job)
-    except JobError as err:
-        print(f"::error::{args.workflow} 的 {args.job}：{err}")
+    except Exception:
+        print("::error::Unsupported job definition or unavailable source")
         return 1
 
     if args.mode == "plan":
@@ -513,12 +549,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.output:
             with open(args.output, "a", encoding="utf-8") as out:
                 out.write(lines)
-        print(lines, end="")
+        print("Job definition accepted")
         return 0
     try:
         return execute(plan, args.src)
-    except JobError as err:
-        print(f"::error::{err}")
+    except Exception:
+        print("::error::Job execution failed")
         return 1
 
 
