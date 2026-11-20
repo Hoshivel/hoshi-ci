@@ -171,7 +171,7 @@ def admit(repo: str, sha: str) -> int:
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write("allowed=" + str(allowed).lower() + "\n")
     print("Ready PR merge verified" if allowed else "Source changed or PR is not Ready; no source work")
-    return 0
+    return 0 if allowed else 1
 
 
 def dispatch() -> int:
