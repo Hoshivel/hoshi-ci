@@ -1,7 +1,8 @@
 # hoshi-ci
 
-自動代跑來源由 `targets.json` 的 `enabled_windows` 明示啟用，初始為空。
-先完成具名試跑，再切換來源倉庫的自動 Windows 工作，避免兩邊同時執行。
+自動代跑來源由 `targets.json` 的 `enabled_windows` 明示啟用，目前只有 `hoshi-data`。
+其餘列在 `windows` 的來源維持受控手動派工。先完成具名試跑，再切換來源倉庫的
+自動 Windows 工作，避免兩邊同時執行。
 
 在這個公開倉庫的 runner 上，代跑 Hoshivel 私有倉庫的 Windows 原生驗證。
 
@@ -14,8 +15,12 @@
   `.github/workflows/ci.yml` 的 `verify-windows` job，照步驟在 `windows-latest` 上跑。
   這裡不另寫指令——要改驗證內容，改那個倉庫的 job。
 - run 的標題是 `Windows <倉庫>@<PR head>`；工作輸入另記錄 PR 編號、base 與 merge SHA。
-  合併者須核對 PR head 與該次凍結的 base、merge，並確認 admission 與 verify-windows
-  都成功，過時來源的 skipped 不算通過。main 正常前進不重派舊 head，也不表示已驗證較新的 base；
+  合併前須確認來源 PR 的當前 head 與 run 標題相同，並讀回該次工作輸入的 PR 編號、
+  head、凍結的 base 與 merge；實際 checkout 必須是該 merge。
+  `Ready PR admission` 與 `verify-windows` 兩個 job 均須實際成功，其中執行來源步驟的
+  `verify-windows` step 也須成功，並保留來源倉庫其餘原有檢查的成功要求。
+  派工成功、歷史 head 的綠燈或來源 Windows 的 skipped 都不能替代這些結果。
+  main 正常前進不重派舊 head，也不表示已驗證較新的 base；
   base 回退或改到不相關歷史則拒絕執行。
   一個 head 已有 run（不論結果，包括尚未執行驗證的 admission 失敗）就不會自動重派。
   歷史超過完整掃描上限時拒絕派工。失敗先診斷，明示重試由操作者處理。
