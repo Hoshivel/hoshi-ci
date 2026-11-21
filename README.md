@@ -9,8 +9,10 @@
 ## 做什麼
 
 - **`派工`**（`dispatch.yml`）：每 15 分鐘與手動。列出啟用來源的同倉 Ready PR，
-  為每個新 head 凍結當時以 main 為基底的 GitHub 合併提交及其兩個父提交。每輪最多派兩項。
-  Windows 分配前及私有 checkout 前各重新核對，草稿與過時提交不做來源工作。
+  為每個新 head 凍結 GitHub 合併提交。第一個父提交記為凍結 base，第二個須等於 Ready head。
+  派工器從 main ref 讀取主線，驗證 PR 回傳的 base、凍結 base 與 main 依序相等或具有祖先關係，
+  容許 PR 的 base 欄位晚於合併提交更新。每輪最多派兩項。Windows 分配前及私有 checkout 前
+  各重新核對，草稿與過時提交不做來源工作。
 - **`Windows`**（`windows.yml`）：checkout 已凍結的合併 commit，讀它自己
   `.github/workflows/ci.yml` 的 `verify-windows` job，照步驟在 `windows-latest` 上跑。
   這裡不另寫指令——要改驗證內容，改那個倉庫的 job。
@@ -20,8 +22,9 @@
   `Ready PR admission` 與 `verify-windows` 兩個 job 均須實際成功，其中執行來源步驟的
   `verify-windows` step 也須成功，並保留來源倉庫其餘原有檢查的成功要求。
   派工成功、歷史 head 的綠燈或來源 Windows 的 skipped 都不能替代這些結果。
-  main 正常前進不重派舊 head，也不表示已驗證較新的 base；
-  base 回退或改到不相關歷史則拒絕執行。
+  main 正常前進時，原工作仍對應同一份凍結合併樹。主線已不含凍結 base 時拒絕執行。
+  工作記錄凍結 base，因此能檢查它是否仍在 main 歷史；若主線改動保留該 base，
+  無法從工作輸入判定其間是否曾改寫。
   一個 head 已有 run（不論結果，包括尚未執行驗證的 admission 失敗）就不會自動重派。
   歷史超過完整掃描上限時拒絕派工。失敗先診斷，明示重試由操作者處理。
 

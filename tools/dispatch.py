@@ -153,12 +153,46 @@ def eligible(owner: str, repo: str, pr: dict) -> bool:
                     (head.get("sha"), base.get("sha"))))
 
 
+def main_tip(source: str, token: str) -> str:
+    ref = f"refs/heads/{DEFAULT_BRANCH}"
+    result = source_api(f"{source}/git/ref/heads/{DEFAULT_BRANCH}", token)
+    target = result.get("object") if isinstance(result, dict) and result.get("ref") == ref else None
+    sha = target.get("sha") if isinstance(target, dict) and target.get("type") == "commit" else None
+    if not isinstance(sha, str) or not SHA.fullmatch(sha):
+        raise ValueError("incomplete main ref")
+    return sha
+
+
+def is_ancestor(source: str, ancestor: str, descendant: str, token: str) -> bool:
+    if ancestor == descendant:
+        return True
+    comparison = source_api(f"{source}/compare/{ancestor}...{descendant}?per_page=1", token)
+    if not isinstance(comparison, dict) or comparison.get("status") != "ahead":
+        return False
+    return all(isinstance(comparison.get(key), dict) and comparison[key].get("sha") == ancestor
+               for key in ("base_commit", "merge_base_commit"))
+
+
+def merge_parents(source: str, merge: str, token: str) -> tuple[str, str] | None:
+    commit = source_api(f"{source}/git/commits/{merge}", token)
+    if not isinstance(commit, dict) or commit.get("sha") != merge:
+        return None
+    parents = commit.get("parents")
+    if not isinstance(parents, list) or len(parents) != 2:
+        return None
+    parent_shas = [parent.get("sha") if isinstance(parent, dict) else None for parent in parents]
+    if parent_shas[0] == parent_shas[1] or not all(isinstance(sha, str) and SHA.fullmatch(sha) for sha in parent_shas):
+        return None
+    return parent_shas[0], parent_shas[1]
+
+
 def ready_candidates(owner: str, repo: str, token: str, seen: set[tuple[str, str]],
                      only_pr: int | None = None) -> list[Candidate]:
     """Freeze new Ready heads using the merge commit GitHub currently reports."""
+    source = f"/repos/{owner}/{repo}"
     result = []
     for page in range(1, 101):
-        batch = source_api(f"/repos/{owner}/{repo}/pulls?state=open&per_page=100&page={page}", token)
+        batch = source_api(f"{source}/pulls?state=open&per_page=100&page={page}", token)
         if not isinstance(batch, list):
             raise ValueError("incomplete pull request collection")
         for item in batch:
@@ -167,16 +201,20 @@ def ready_candidates(owner: str, repo: str, token: str, seen: set[tuple[str, str
             number = item["number"]
             if (repo, item["head"]["sha"]) in seen or (only_pr is not None and number != only_pr):
                 continue
-            pr = source_api(f"/repos/{owner}/{repo}/pulls/{number}", token)
-            merge = pr.get("merge_commit_sha", "")
-            if not eligible(owner, repo, pr) or pr.get("mergeable") is not True or not SHA.fullmatch(merge or ""):
+            pr = source_api(f"{source}/pulls/{number}", token)
+            if not eligible(owner, repo, pr) or pr["number"] != number or pr.get("mergeable") is not True:
                 continue
-            if (repo, pr["head"]["sha"]) in seen:
+            merge, head = pr.get("merge_commit_sha"), pr["head"]["sha"]
+            if not isinstance(merge, str) or not SHA.fullmatch(merge) or (repo, head) in seen:
                 continue
-            commit = source_api(f"/repos/{owner}/{repo}/git/commits/{merge}", token)
-            parents = [p["sha"] for p in commit.get("parents", [])]
-            if commit.get("sha") == merge and parents == [pr["base"]["sha"], pr["head"]["sha"]]:
-                result.append(Candidate(repo, number, pr["head"]["sha"], pr["base"]["sha"], merge))
+            parents = merge_parents(source, merge, token)
+            if parents is None or parents[1] != head:
+                continue
+            # PR metadata can lag the base used to generate GitHub's merge commit.
+            base = parents[0]
+            if (is_ancestor(source, pr["base"]["sha"], base, token)
+                    and is_ancestor(source, base, main_tip(source, token), token)):
+                result.append(Candidate(repo, number, head, base, merge))
         if len(batch) < 100:
             return result
     raise ValueError("pull request collection exceeds the complete-scan bound")
@@ -199,20 +237,16 @@ def seen_runs(own_repo: str, token: str) -> set[tuple[str, str]]:
 def snapshot_current(owner: str, candidate: Candidate, token: str) -> bool:
     """Keep the frozen merge while rejecting closed, drafted or changed heads."""
     repo = candidate.repository
-    pr = source_api(f"/repos/{owner}/{repo}/pulls/{candidate.number}", token)
-    if not eligible(owner, repo, pr) or pr.get("number") != candidate.number or pr["head"]["sha"] != candidate.head:
+    source = f"/repos/{owner}/{repo}"
+    pr = source_api(f"{source}/pulls/{candidate.number}", token)
+    if not eligible(owner, repo, pr) or pr["number"] != candidate.number or pr["head"]["sha"] != candidate.head:
         return False
-    # A rewind or unrelated base changes the meaning of the frozen snapshot.
-    current_base = pr["base"]["sha"]
-    if current_base != candidate.base:
-        comparison = source_api(f"/repos/{owner}/{repo}/compare/{candidate.base}...{current_base}", token)
-        if (comparison.get("status") != "ahead" or
-                comparison.get("merge_base_commit", {}).get("sha") != candidate.base):
-            return False
-    elif pr.get("merge_commit_sha") != candidate.merge or pr.get("mergeable") is not True:
+    current_base = main_tip(source, token)
+    if not is_ancestor(source, candidate.base, current_base, token):
         return False
-    commit = source_api(f"/repos/{owner}/{repo}/git/commits/{candidate.merge}", token)
-    return commit.get("sha") == candidate.merge and [p.get("sha") for p in commit.get("parents", [])] == [candidate.base, candidate.head]
+    if current_base == candidate.base and (pr.get("merge_commit_sha") != candidate.merge or pr.get("mergeable") is not True):
+        return False
+    return merge_parents(source, candidate.merge, token) == (candidate.base, candidate.head)
 
 
 def admit(repo: str, sha: str, base: str, merge: str, pr: str) -> int:
@@ -340,8 +374,13 @@ def selftest() -> int:
     dispatched = []
     history = []
     source_error = None
+    failed_read = ""
     commit = {"sha": c, "parents": [{"sha": b}, {"sha": a}]}
-    comparison = {"status": "ahead", "merge_base_commit": {"sha": b}}
+    original_commit = copy.deepcopy(commit)
+    tip = b
+    comparisons = {(older, newer): {"status": "ahead", "base_commit": {"sha": older},
+                                    "merge_base_commit": {"sha": older}}
+                   for older, newer in ((b, d), (d, e))}
     def fake(method, path, token, body=None):
         calls.append((method, path))
         if method == "POST":
@@ -350,7 +389,7 @@ def selftest() -> int:
             return None
         if "/actions/workflows/" in path:
             return {"workflow_runs": history}
-        if source_error:
+        if source_error and failed_read in path:
             raise urllib.error.HTTPError(path, source_error, "private response body", {}, None)
         if "pulls?" in path:
             return [pr]
@@ -359,8 +398,11 @@ def selftest() -> int:
         if "/git/commits/" in path:
             assert path.endswith(c)
             return commit
+        if path.endswith("/git/ref/heads/main"):
+            return {"ref": "refs/heads/main", "object": {"type": "commit", "sha": tip}}
         if "/compare/" in path:
-            return comparison
+            pair = tuple(path.removesuffix("?per_page=1").split("/compare/")[1].split("..."))
+            return comparisons.get(pair, {"status": "diverged", "merge_base_commit": {"sha": a}})
         raise AssertionError("unexpected API path")
     saved_environment = dict(os.environ)
     try:
@@ -372,17 +414,38 @@ def selftest() -> int:
         assert len(calls) == 1, "known heads must not resolve a new merge"
         assert ready_candidates("Hoshivel", "hoshi-data", "unused", set(), 8) == []
 
-        # A normal base advance preserves the frozen merge, without redispatch.
-        pr["base"]["sha"] = d
+        # GitHub used d for the merge while the PR API still reports b.
+        tip = d
+        commit["parents"][0]["sha"] = d
+        actual = Candidate("hoshi-data", 7, a, d, c)
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", set()) == [actual]
+        assert snapshot_current("Hoshivel", actual, "unused")
+        tip = b
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", set()) == []
+        assert not snapshot_current("Hoshivel", actual, "unused")
+        tip = e
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", set()) == [actual]
+        assert snapshot_current("Hoshivel", actual, "unused")
+        pr["base"]["sha"] = e
+        assert ready_candidates("Hoshivel", "hoshi-data", "unused", set()) == []
+
+        # A normal base advance preserves the frozen merge even with a stale PR base.
+        commit = copy.deepcopy(original_commit)
+        pr = copy.deepcopy(original)
+        tip = d
         pr["merge_commit_sha"] = e
         assert snapshot_current("Hoshivel", frozen, "unused")
         assert ready_candidates("Hoshivel", "hoshi-data", "unused", {("hoshi-data", a)}) == []
-        comparison["status"] = "behind"
+        comparisons[(b, d)]["status"] = "behind"
         assert not snapshot_current("Hoshivel", frozen, "unused")
-        comparison["status"] = "ahead"
-        comparison["merge_base_commit"]["sha"] = e
+        comparisons[(b, d)]["status"] = "ahead"
+        comparisons[(b, d)]["merge_base_commit"]["sha"] = e
         assert not snapshot_current("Hoshivel", frozen, "unused")
-        comparison["merge_base_commit"]["sha"] = b
+        comparisons[(b, d)]["merge_base_commit"]["sha"] = b
+        comparisons[(b, d)]["base_commit"]["sha"] = e
+        assert not snapshot_current("Hoshivel", frozen, "unused")
+        comparisons[(b, d)]["base_commit"]["sha"] = b
+        tip = b
         pr = copy.deepcopy(original)
         for key, value in (("draft", True), ("state", "closed"), ("number", 8), ("mergeable", None), ("merge_commit_sha", e)):
             pr[key] = value
@@ -395,10 +458,16 @@ def selftest() -> int:
         pr["head"]["repo"]["full_name"] = "outside/hoshi-data"
         assert not snapshot_current("Hoshivel", frozen, "unused")
         pr = copy.deepcopy(original)
-        commit["parents"].reverse()
+        for parents in ([{"sha": a}, {"sha": b}], [{"sha": b}], [{"sha": b}, {"sha": a}, {"sha": d}],
+                        [{"sha": a}, {"sha": a}], [{"sha": b}, None], [{"sha": "invalid"}, {"sha": a}]):
+            commit["parents"] = parents
+            assert not snapshot_current("Hoshivel", frozen, "unused")
+            assert ready_candidates("Hoshivel", "hoshi-data", "unused", set()) == []
+        commit = copy.deepcopy(original_commit)
+        commit["sha"] = e
         assert not snapshot_current("Hoshivel", frozen, "unused")
         assert ready_candidates("Hoshivel", "hoshi-data", "unused", set()) == []
-        commit["parents"].reverse()
+        commit = copy.deepcopy(original_commit)
 
         os.environ.update({"GITHUB_REPOSITORY": "Hoshivel/hoshi-ci", "GITHUB_REPOSITORY_OWNER": "Hoshivel",
                            "GITHUB_REF": "refs/heads/main", "GITHUB_REF_NAME": "main",
@@ -420,9 +489,13 @@ def selftest() -> int:
             os.environ["DRY_RUN"] = "true"
             assert dispatch() == 0
             assert len(dispatched) == 1
+            os.environ["DRY_RUN"] = "false"
             source_error = 403
-            assert dispatch() == 1
-            assert main(["admit", "--repo", "hoshi-data", "--sha", a, "--base", b, "--merge", c, "--pr", "7"]) == 1
+            tip = d
+            for failed_read in ("/pulls", "/git/ref/", "/git/commits/", "/compare/"):
+                assert dispatch() == 1
+                assert main(["admit", "--repo", "hoshi-data", "--sha", a, "--base", b, "--merge", c, "--pr", "7"]) == 1
+                assert len(dispatched) == 1
             assert "Pull requests: read" in output.getvalue()
             assert "private response body" not in output.getvalue()
     finally:
