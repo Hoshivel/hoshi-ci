@@ -14,7 +14,10 @@ on:
 
 # 同一個 PR 上再推一次就取消前一次；`main` 不取消。
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # 草稿 PR 的 opened／synchronize／reopened 不配置任何 job，各自以 run ID 成組：GitHub 不保證
+  # 依事件順序建立執行，晚到的這種事件不得取消已就緒的執行。converted_to_draft 與就緒事件
+  # 同組，照舊取消前一次執行。
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'pull_request' && github.event.pull_request.draft && github.event.action != 'converted_to_draft' && format('-draft-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
