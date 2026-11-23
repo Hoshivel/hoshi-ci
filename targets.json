@@ -1,5 +1,5 @@
 {
-  "enabled_windows": ["hoshi-data"],
+  "enabled_windows": ["hoshi-data", "ShatteredRealms"],
   "windows": [
     "ShatteredRealms",
     "hoshi-admin",
