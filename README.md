@@ -1,8 +1,8 @@
 # hoshi-ci
 
-自動代跑來源由 `targets.json` 的 `enabled_windows` 明示啟用，目前只有 `hoshi-data`。
-其餘列在 `windows` 的來源維持受控手動派工。先完成具名試跑，再切換來源倉庫的
-自動 Windows 工作，避免兩邊同時執行。
+自動代跑來源由 `targets.json` 的 `enabled_windows` 明示啟用。新來源先列入 `windows`，
+以受控手動派工完成具名試跑，再加入 `enabled_windows` 並切換來源倉庫的自動 Windows
+工作，避免兩邊同時執行。
 
 在這個公開倉庫的 runner 上，代跑 Hoshivel 私有倉庫的 Windows 原生驗證。
 
