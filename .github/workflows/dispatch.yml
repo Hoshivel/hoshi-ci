@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       profile:
-        description: Optional windows or cdp-windows route; empty uses all enabled routes.
+        description: Optional windows or cdp-windows route; empty uses windows with repo, otherwise all enabled routes.
         required: false
         type: string
       repo:

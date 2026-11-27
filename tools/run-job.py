@@ -47,6 +47,9 @@ PROFILES = {
     "windows": (WORKFLOW, JOB),
     "cdp-windows": (".github/workflows/cdp-lifecycle.yml", "lifecycle"),
 }
+CDP_CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
+CDP_SETUP_NODE = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
+CDP_ACTIONS = frozenset((CDP_CHECKOUT, CDP_SETUP_NODE))
 
 JOB_KEYS = {"if", "name", "needs", "runs-on", "timeout-minutes", "env", "defaults", "steps"}
 STEP_KEYS = {"name", "id", "run", "uses", "with", "env", "shell", "working-directory"}
@@ -191,8 +194,8 @@ def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan
                 raise JobError(f"{where} 同時有 uses 與 run")
             if profile == "cdp-windows" and (
                     not isinstance(step["uses"], str)
-                    or not re.fullmatch(r"actions/(checkout|setup-node)@[0-9a-f]{40}", step["uses"])):
-                raise JobError("CDP actions must use a fixed commit")
+                    or step["uses"] not in CDP_ACTIONS):
+                raise JobError("CDP action revision is not supported")
             action = str(step["uses"]).split("@", 1)[0]
             options = step.get("with") or {}
             if not isinstance(options, dict):
@@ -501,8 +504,8 @@ def selftest() -> int:
             "runs-on": RUNS_ON,
             "timeout-minutes": 5,
             "steps": [
-                {"uses": "actions/checkout@" + "0" * 40},
-                {"uses": "actions/setup-node@" + "0" * 40, "with": {"node-version": "22"}},
+                {"uses": CDP_CHECKOUT},
+                {"uses": CDP_SETUP_NODE, "with": {"node-version": "22"}},
                 {"run": "node --test fixture.test.mjs"},
             ],
         }},
@@ -522,6 +525,8 @@ def selftest() -> int:
         "setup cache": lambda j: j["steps"][1]["with"].update({"cache": "npm"}),
         "setup environment": lambda j: j["steps"][1].update({"env": {"X": "value"}}),
         "checkout without pin": lambda j: j["steps"][0].update({"uses": "actions/checkout"}),
+        "other checkout commit": lambda j: j["steps"][0].update({"uses": "actions/checkout@" + "1" * 40}),
+        "other Node commit": lambda j: j["steps"][1].update({"uses": "actions/setup-node@" + "1" * 40}),
         "Node tag pin": lambda j: j["steps"][1].update({"uses": "actions/setup-node@v7"}),
         "Node variable pin": lambda j: j["steps"][1].update({"uses": "actions/setup-node@${{ vars.SHA }}"}),
         "Node missing pin": lambda j: j["steps"][1].update({"uses": "actions/setup-node@"}),
@@ -539,6 +544,13 @@ def selftest() -> int:
         except JobError:
             continue
         raise AssertionError(f"CDP should reject: {what}")
+    import yaml
+    wrapper_path = Path(__file__).resolve().parent.parent / ".github/workflows/cdp-windows.yml"
+    wrapper = yaml.safe_load(wrapper_path.read_text(encoding="utf-8"))
+    wrapper_actions = [step["uses"] for job in wrapper["jobs"].values()
+                       for step in job["steps"] if "uses" in step]
+    assert [action for action in wrapper_actions if action.startswith("actions/setup-node@")] == [CDP_SETUP_NODE]
+    assert all(action == CDP_CHECKOUT for action in wrapper_actions if action.startswith("actions/checkout@"))
     for arguments in (("unknown", None, None), ("windows", None, "lifecycle"),
                       ("cdp-windows", WORKFLOW, None), ("cdp-windows", None, JOB)):
         try:
