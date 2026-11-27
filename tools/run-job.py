@@ -5,7 +5,7 @@ hoshi-ci 不保存被驗證倉庫的指令。它讀 checkout 下來那個 commit
 取出指定的 job，照順序執行其中的 `run` 步驟——所以驗證內容只寫在私有倉庫那一份：
 那邊改了，這裡跑的就跟著改，沒有第二份會漂移。
 
-只認得那些 job 實際用到的形狀。不認得的鍵、`${{ }}` 算式、checkout／setup-go 以外的
+只認得具名 profile 實際用到的形狀。不認得的鍵、`${{ }}` 算式、profile 未允許的
 action 一律是錯誤，不是跳過：一個安靜沒跑的步驟，與一個跑過且通過的步驟長得一模一樣。
 
 唯一的例外是私有 module 憑證那一步：它由 workflow 自己的下載步驟代替，而那是唯一
@@ -19,6 +19,8 @@ action 一律是錯誤，不是跳過：一個安靜沒跑的步驟，與一個�
                               驗證 job 形狀，把 go-version-file 與 module-dir
                               以 key=value 附加到 FILE，stdout 只報形狀通過
   run-job.py run  --src DIR   執行 run 步驟
+  run-job.py plan --src DIR --profile cdp-windows
+                              讀固定 CDP job，輸出 node-version
   run-job.py selftest         只跑內建案例
 """
 
@@ -41,6 +43,10 @@ from pathlib import Path, PurePosixPath
 WORKFLOW = ".github/workflows/ci.yml"
 JOB = "verify-windows"
 RUNS_ON = "windows-latest"
+PROFILES = {
+    "windows": (WORKFLOW, JOB),
+    "cdp-windows": (".github/workflows/cdp-lifecycle.yml", "lifecycle"),
+}
 
 JOB_KEYS = {"if", "name", "needs", "runs-on", "timeout-minutes", "env", "defaults", "steps"}
 STEP_KEYS = {"name", "id", "run", "uses", "with", "env", "shell", "working-directory"}
@@ -73,14 +79,17 @@ class Step:
 
 @dataclass
 class Plan:
-    go_version_file: str
+    go_version_file: str | None
     timeout_minutes: int
     env: dict[str, str]
     steps: list[Step]
     notes: list[str] = field(default_factory=list)
+    node_version: str | None = None
 
     @property
     def module_dir(self) -> str:
+        if self.go_version_file is None:
+            raise JobError("this profile has no Go module")
         parent = PurePosixPath(self.go_version_file).parent
         return str(parent) if str(parent) else "."
 
@@ -108,7 +117,18 @@ def relative(where: str, value: object) -> str:
     return str(path)
 
 
-def build_plan(doc: dict, job_name: str = JOB) -> Plan:
+def profile_source(profile: str, workflow: str | None = None,
+                   job: str | None = None) -> tuple[str, str]:
+    if profile not in PROFILES:
+        raise JobError("unsupported execution profile")
+    expected_workflow, expected_job = PROFILES[profile]
+    if workflow not in (None, expected_workflow) or job not in (None, expected_job):
+        raise JobError("workflow or job does not match execution profile")
+    return expected_workflow, expected_job
+
+
+def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan:
+    profile_source(profile, job=job_name)
     if not isinstance(doc, dict):
         raise JobError("workflow 不是一個 mapping")
     job = (doc.get("jobs") or {}).get(job_name)
@@ -155,6 +175,8 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
     steps: list[Step] = []
     notes: list[str] = []
     go_version_file: str | None = None
+    node_version: str | None = None
+    checkout_seen = False
 
     for index, step in enumerate(job.get("steps") or [], 1):
         where = f"第 {index} 步"
@@ -167,15 +189,28 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
         if "uses" in step:
             if "run" in step:
                 raise JobError(f"{where} 同時有 uses 與 run")
+            if profile == "cdp-windows" and (
+                    not isinstance(step["uses"], str)
+                    or not re.fullmatch(r"actions/(checkout|setup-node)@[0-9a-f]{40}", step["uses"])):
+                raise JobError("CDP actions must use a fixed commit")
             action = str(step["uses"]).split("@", 1)[0]
             options = step.get("with") or {}
+            if not isinstance(options, dict):
+                raise JobError("action options must be a mapping")
+            if profile == "cdp-windows" and set(step) - {"name", "uses", "with"}:
+                raise JobError("unsupported CDP action fields")
             if action == "actions/checkout":
                 # The workflow has already checked out this commit; options
                 # would mean a different checkout, which is not replicated.
                 if options:
                     raise JobError(f"{where}：actions/checkout 帶了選項，這裡不重現")
+                if profile == "cdp-windows" and (checkout_seen or node_version is not None or steps):
+                    raise JobError("CDP checkout must occur once before setup and execution")
+                checkout_seen = True
                 continue
             if action == "actions/setup-go":
+                if profile != "windows":
+                    raise JobError("Go setup is not allowed by this profile")
                 if go_version_file is not None:
                     raise JobError(f"{where}：第二個 actions/setup-go")
                 if steps:
@@ -184,7 +219,16 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
                     raise JobError(f"{where}：actions/setup-go 只認 go-version-file")
                 go_version_file = relative(f"{where} go-version-file", options.get("go-version-file"))
                 continue
-            raise JobError(f"{where} 用了 {action}；這裡只認 actions/checkout 與 actions/setup-go")
+            if action == "actions/setup-node":
+                if profile != "cdp-windows":
+                    raise JobError("Node setup is not allowed by this profile")
+                if node_version is not None or steps or not checkout_seen:
+                    raise JobError("CDP Node setup must occur once after checkout and before execution")
+                if options != {"node-version": "22"}:
+                    raise JobError("CDP requires Node 22 without cache or other setup options")
+                node_version = "22"
+                continue
+            raise JobError("action is not supported by this profile")
 
         run = step.get("run")
         if not isinstance(run, str) or not run.strip():
@@ -194,6 +238,8 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
             raise JobError(f"{where} 的 env 不是 mapping")
 
         if any(isinstance(v, str) and CREDENTIAL.search(v) for v in step_env.values()):
+            if profile != "windows":
+                raise JobError("credential steps cannot be omitted by this profile")
             notes.append("Module authentication is handled before source execution.")
             continue
 
@@ -216,23 +262,28 @@ def build_plan(doc: dict, job_name: str = JOB) -> Plan:
             cwd=cwd,
         ))
 
-    if go_version_file is None:
+    if profile == "windows" and go_version_file is None:
         raise JobError("沒有 actions/setup-go 的 go-version-file")
+    if profile == "cdp-windows" and node_version is None:
+        raise JobError("CDP requires Node setup")
     if not steps:
         raise JobError("沒有任何 run 步驟")
-    return Plan(go_version_file, timeout, env, steps, notes)
+    return Plan(go_version_file, timeout, env, steps, notes, node_version)
 
 
-def load_plan(src: Path, workflow: str, job: str) -> Plan:
+def load_plan(src: Path, workflow: str | None = None, job: str | None = None,
+              profile: str = "windows") -> Plan:
     import yaml  # installed, pinned, by the workflow step before this one
 
+    workflow, job = profile_source(profile, workflow, job)
     path = src / relative("workflow", workflow)
     if not path.is_file() or not path.resolve().is_relative_to(src.resolve()):
         raise JobError(f"{workflow} 不存在")
-    plan = build_plan(yaml.safe_load(path.read_text(encoding="utf-8")), job)
-    module = src / plan.go_version_file
-    if not module.is_file() or not module.resolve().is_relative_to(src.resolve()):
-        raise JobError("module file escapes or is absent from source")
+    plan = build_plan(yaml.safe_load(path.read_text(encoding="utf-8")), job, profile)
+    if plan.go_version_file is not None:
+        module = src / plan.go_version_file
+        if not module.is_file() or not module.resolve().is_relative_to(src.resolve()):
+            raise JobError("module file escapes or is absent from source")
     return plan
 
 
@@ -362,7 +413,8 @@ def execute(plan: Plan, src: Path) -> int:
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as out:
-            out.write(f"### {JOB}\n\n| 步驟 | 結果 | 時間 |\n|---|---|---|\n")
+            label = "CDP Windows" if plan.node_version else JOB
+            out.write(f"### {label}\n\n| 步驟 | 結果 | 時間 |\n|---|---|---|\n")
             for label, result, elapsed in rows:
                 out.write(f"| `{label}` | {result} | {elapsed} |\n")
             out.write("\nDetailed output is withheld. Reproduce this source revision privately.\n")
@@ -442,6 +494,64 @@ def selftest() -> int:
         except JobError:
             continue
         raise AssertionError(f"應該拒絕：{what}")
+
+    cdp = {
+        "jobs": {"lifecycle": {
+            "needs": ["eligibility"],
+            "runs-on": RUNS_ON,
+            "timeout-minutes": 5,
+            "steps": [
+                {"uses": "actions/checkout@" + "0" * 40},
+                {"uses": "actions/setup-node@" + "0" * 40, "with": {"node-version": "22"}},
+                {"run": "node --test fixture.test.mjs"},
+            ],
+        }},
+    }
+    cdp_plan = build_plan(cdp, "lifecycle", "cdp-windows")
+    assert cdp_plan.node_version == "22" and cdp_plan.go_version_file is None
+    assert cdp_plan.timeout_minutes == 5 and len(cdp_plan.steps) == 1
+    assert cdp_plan.steps[0].shell == "pwsh" and cdp_plan.steps[0].cwd == "."
+    cdp_rejected = {
+        "missing setup": lambda j: j["steps"].pop(1),
+        "missing checkout": lambda j: j["steps"].pop(0),
+        "duplicate checkout": lambda j: j["steps"].insert(1, j["steps"][0]),
+        "duplicate setup": lambda j: j["steps"].insert(2, j["steps"][1]),
+        "late setup": lambda j: j["steps"].append(j["steps"].pop(1)),
+        "other Node": lambda j: j["steps"][1]["with"].update({"node-version": "23"}),
+        "numeric Node": lambda j: j["steps"][1]["with"].update({"node-version": 22}),
+        "setup cache": lambda j: j["steps"][1]["with"].update({"cache": "npm"}),
+        "setup environment": lambda j: j["steps"][1].update({"env": {"X": "value"}}),
+        "checkout without pin": lambda j: j["steps"][0].update({"uses": "actions/checkout"}),
+        "Node tag pin": lambda j: j["steps"][1].update({"uses": "actions/setup-node@v7"}),
+        "Node variable pin": lambda j: j["steps"][1].update({"uses": "actions/setup-node@${{ vars.SHA }}"}),
+        "Node missing pin": lambda j: j["steps"][1].update({"uses": "actions/setup-node@"}),
+        "Go setup": lambda j: j["steps"].insert(2, base["jobs"][JOB]["steps"][1]),
+        "credential omission": lambda j: j["steps"].insert(2, base["jobs"][JOB]["steps"][2]),
+        "run expression": lambda j: j["steps"][2].update({"run": "node ${{ matrix.test }}"}),
+        "other prerequisite": lambda j: j.update({"needs": ["eligibility", "build"]}),
+    }
+    import copy
+    for what, mutate in cdp_rejected.items():
+        changed = copy.deepcopy(cdp)
+        mutate(changed["jobs"]["lifecycle"])
+        try:
+            build_plan(changed, "lifecycle", "cdp-windows")
+        except JobError:
+            continue
+        raise AssertionError(f"CDP should reject: {what}")
+    for arguments in (("unknown", None, None), ("windows", None, "lifecycle"),
+                      ("cdp-windows", WORKFLOW, None), ("cdp-windows", None, JOB)):
+        try:
+            profile_source(*arguments)
+        except JobError:
+            continue
+        raise AssertionError("profile source binding accepted an unsupported combination")
+    try:
+        build_plan({"jobs": {JOB: cdp["jobs"]["lifecycle"]}})
+    except JobError:
+        pass
+    else:
+        raise AssertionError("Go profile accepted Node setup")
     try:
         build_plan({"jobs": {}})
     except JobError:
@@ -475,18 +585,33 @@ def selftest() -> int:
     with tempfile.TemporaryDirectory() as folder:
         work = Path(folder)
         summary = work / "summary.md"
-        public = io.StringIO()
-        sample = Plan("go.mod", 1, {}, [Step(private, "pwsh", private, {}, ".")])
-        with patch.dict(os.environ, {"RUNNER_TEMP": folder, "GITHUB_STEP_SUMMARY": str(summary)}), \
-             patch.object(sys.modules[__name__], "command", return_value=[sys.executable, "-c", script]), \
-             contextlib.redirect_stdout(public):
-            assert execute(sample, work) == 1
-        assert private not in public.getvalue() and private not in summary.read_text(encoding="utf-8")
-        assert "Step 1" in public.getvalue() and "exit 17" in public.getvalue()
-        assert private in (work / "hoshi-ci-job/step1.log").read_text()
+        for module, node in (("go.mod", None), (None, "22")):
+            public = io.StringIO()
+            sample = Plan(module, 1, {}, [Step(private, "pwsh", private, {}, ".")], node_version=node)
+            with patch.dict(os.environ, {"RUNNER_TEMP": folder, "GITHUB_STEP_SUMMARY": str(summary)}), \
+                 patch.object(sys.modules[__name__], "command", return_value=[sys.executable, "-c", script]), \
+                 contextlib.redirect_stdout(public):
+                assert execute(sample, work) == 1
+            assert private not in public.getvalue() and private not in summary.read_text(encoding="utf-8")
+            assert "Step 1" in public.getvalue() and "exit 17" in public.getvalue()
+            assert private in (work / "hoshi-ci-job/step1.log").read_text()
 
         invalid = work / ".github/workflows"
         invalid.mkdir(parents=True)
+        import yaml
+        (invalid / "cdp-lifecycle.yml").write_text(yaml.safe_dump(cdp), encoding="utf-8")
+        output = work / "plan-output"
+        public = io.StringIO()
+        with contextlib.redirect_stdout(public):
+            assert main(["plan", "--src", str(work), "--profile", "cdp-windows",
+                         "--output", str(output)]) == 0
+        assert output.read_text(encoding="utf-8") == "node-version=22\n"
+        assert public.getvalue() == "Job definition accepted\n"
+        public = io.StringIO()
+        with contextlib.redirect_stdout(public):
+            assert main(["plan", "--src", str(work), "--profile", "cdp-windows",
+                         "--workflow", WORKFLOW]) == 1
+        assert public.getvalue() == "::error::Unsupported job definition or unavailable source\n"
         (invalid / "ci.yml").write_text("jobs: [" + private, encoding="utf-8")
         public = io.StringIO()
         with contextlib.redirect_stdout(public):
@@ -528,8 +653,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("mode", choices=("plan", "run", "selftest"))
     parser.add_argument("--src", type=Path, help="被驗證倉庫 checkout 的位置")
-    parser.add_argument("--workflow", default=WORKFLOW)
-    parser.add_argument("--job", default=JOB)
+    parser.add_argument("--profile", choices=tuple(PROFILES), default="windows")
+    parser.add_argument("--workflow", help="必須與 profile 的固定 workflow 相符")
+    parser.add_argument("--job", help="必須與 profile 的固定 job 相符")
     parser.add_argument("--output", help="plan 的 key=value 附加到這個檔（$GITHUB_OUTPUT）")
     args = parser.parse_args(argv)
 
@@ -539,13 +665,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("plan 與 run 需要 --src")
 
     try:
-        plan = load_plan(args.src, args.workflow, args.job)
+        plan = load_plan(args.src, args.workflow, args.job, args.profile)
     except Exception:
         print("::error::Unsupported job definition or unavailable source")
         return 1
 
     if args.mode == "plan":
-        lines = f"go-version-file={plan.go_version_file}\nmodule-dir={plan.module_dir}\n"
+        if plan.node_version is not None:
+            lines = f"node-version={plan.node_version}\n"
+        else:
+            lines = f"go-version-file={plan.go_version_file}\nmodule-dir={plan.module_dir}\n"
         if args.output:
             with open(args.output, "a", encoding="utf-8") as out:
                 out.write(lines)

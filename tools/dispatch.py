@@ -37,6 +37,10 @@ TARGETS = ROOT / "targets.json"
 API = "https://api.github.com"
 WORKFLOW = "windows.yml"
 DEFAULT_BRANCH = "main"
+PROFILES = {
+    "windows": (WORKFLOW, "Windows", "windows", "enabled_windows"),
+    "cdp-windows": ("cdp-windows.yml", "Windows CDP", "cdp_windows", "enabled_cdp_windows"),
+}
 
 REPO = re.compile(r"^[A-Za-z0-9._-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -67,29 +71,35 @@ class SourceReadError(Exception):
         self.status = status
 
 
-def title(repo: str, sha: str) -> str:
-    return f"Windows {repo}@{sha}"
+def title(repo: str, sha: str, profile: str = "windows") -> str:
+    return f"{PROFILES[profile][1]} {repo}@{sha}"
 
 
-def load_targets(path: Path = TARGETS, *, enabled: bool = False) -> list[str]:
+def load_targets(path: Path = TARGETS, *, enabled: bool = False,
+                 profile: str = "windows") -> list[str]:
+    if profile not in PROFILES:
+        raise ValueError("unknown execution profile")
+    _, _, key, enabled_key = PROFILES[profile]
     document = json.loads(path.read_text(encoding="utf-8"))
-    repos = document.get("windows")
-    if not isinstance(repos, list) or not repos or not all(isinstance(r, str) and REPO.match(r) for r in repos):
-        raise ValueError(f"{path.name} 的 windows 必須是非空的倉庫名清單")
+    repos = document.get(key, [] if profile == "cdp-windows" else None)
+    if not isinstance(repos, list) or (profile == "windows" and not repos) or not all(isinstance(r, str) and REPO.fullmatch(r) for r in repos):
+        raise ValueError("invalid execution profile repository list")
+    if profile == "cdp-windows" and any(repo != "ShatteredRealms" for repo in repos):
+        raise ValueError("CDP Windows only supports ShatteredRealms")
     if len(set(repos)) != len(repos):
         raise ValueError(f"{path.name} 的 windows 有重複")
     if not enabled:
         return repos
-    active = document.get("enabled_windows", [])
+    active = document.get(enabled_key, [])
     if not isinstance(active, list) or any(r not in repos for r in active) or len(set(active)) != len(active):
         raise ValueError("invalid enabled Windows list")
     return active
 
 
 def check(repo: str, sha: str, base: str, merge: str, pr: str,
-          path: Path = TARGETS) -> str | None:
+          path: Path = TARGETS, *, profile: str = "windows") -> str | None:
     """Return the reason the inputs are rejected, or None."""
-    if repo not in load_targets(path):
+    if repo not in load_targets(path, profile=profile):
         return "repository is not in the Windows allowlist"
     if not all(isinstance(value, str) and SHA.fullmatch(value) for value in (sha, base, merge)):
         return "head, base and merge must be 40 lowercase hexadecimal characters"
@@ -220,13 +230,15 @@ def ready_candidates(owner: str, repo: str, token: str, seen: set[tuple[str, str
     raise ValueError("pull request collection exceeds the complete-scan bound")
 
 
-def seen_runs(own_repo: str, token: str) -> set[tuple[str, str]]:
+def seen_runs(own_repo: str, token: str, profile: str = "windows") -> set[tuple[str, str]]:
     seen: set[tuple[str, str]] = set()
+    workflow, prefix, _, _ = PROFILES[profile]
+    pattern = re.compile(r"^" + re.escape(prefix) + r" (?P<repo>[A-Za-z0-9._-]+)@(?P<sha>[0-9a-f]{40})$")
     for page in range(1, RUN_PAGES + 1):
-        data = api("GET", f"/repos/{own_repo}/actions/workflows/{WORKFLOW}/runs?per_page=100&page={page}", token)
+        data = api("GET", f"/repos/{own_repo}/actions/workflows/{workflow}/runs?per_page=100&page={page}", token)
         runs = data.get("workflow_runs") or []
         for run in runs:
-            match = TITLE.match(run.get("display_title") or "")
+            match = pattern.fullmatch(run.get("display_title") or "")
             if match:
                 seen.add((match["repo"], match["sha"]))
         if len(runs) < 100:
@@ -249,9 +261,10 @@ def snapshot_current(owner: str, candidate: Candidate, token: str) -> bool:
     return merge_parents(source, candidate.merge, token) == (candidate.base, candidate.head)
 
 
-def admit(repo: str, sha: str, base: str, merge: str, pr: str) -> int:
+def admit(repo: str, sha: str, base: str, merge: str, pr: str,
+          profile: str = "windows") -> int:
     """Recheck before Windows allocation and again immediately before checkout."""
-    if check(repo, sha, base, merge, pr):
+    if check(repo, sha, base, merge, pr, profile=profile):
         raise ValueError("invalid worker identity")
     own = os.environ["GITHUB_REPOSITORY"]
     owner = own.split("/")[0]
@@ -278,7 +291,7 @@ def dispatch() -> int:
         print("::error::缺少 GH_TOKEN 或 GITHUB_REPOSITORY；這支只在 Actions 裡跑。")
         return 1
 
-    candidates: list[Candidate] = []
+    queues: dict[str, list[Candidate]] = {}
     unreadable: list[tuple[str, int]] = []
     if ref != DEFAULT_BRANCH or os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("dispatcher requires its default branch")
@@ -286,26 +299,43 @@ def dispatch() -> int:
     manual_pr = os.environ.get("MANUAL_PR", "")
     if manual_pr and (not manual or not manual_pr.isascii() or not manual_pr.isdigit() or int(manual_pr) < 1):
         raise ValueError("manual PR requires an allowed repository and positive number")
-    selected = [manual] if manual else load_targets(enabled=True)
-    if manual and manual not in load_targets():
-        raise ValueError("manual target is not allowed")
-    seen = seen_runs(own_repo, own)
-    for repo in selected:
-        try:
-            candidates += ready_candidates(owner, repo, source, seen, int(manual_pr) if manual_pr else None)
-        except SourceReadError as err:
-            unreadable.append((repo, err.status))
-    chosen, deferred = select(candidates, seen, MAX_DISPATCH)
-    dry_run = os.environ.get("DRY_RUN", "false") == "true"
-    for candidate in chosen:
-        if dry_run:
-            print(f"Selected {candidate.repository}@{candidate.head}")
+    requested = os.environ.get("MANUAL_PROFILE", "")
+    if requested and requested not in PROFILES:
+        raise ValueError("unknown execution profile")
+    profiles = [requested or "windows"] if requested or manual else list(PROFILES)
+    repo_count = 0
+    for profile in profiles:
+        selected = [manual] if manual else load_targets(enabled=True, profile=profile)
+        if manual and manual not in load_targets(profile=profile):
+            raise ValueError("manual target is not allowed")
+        if not selected:
             continue
-        api("POST", f"/repos/{own_repo}/actions/workflows/{WORKFLOW}/dispatches", own,
+        repo_count += len(selected)
+        seen = seen_runs(own_repo, own, profile)
+        candidates: list[Candidate] = []
+        for repo in selected:
+            try:
+                candidates += ready_candidates(owner, repo, source, seen, int(manual_pr) if manual_pr else None)
+            except SourceReadError as err:
+                unreadable.append((repo, err.status))
+        queues[profile] = select(candidates, seen, len(candidates))[0]
+    # Alternate routes within one aggregate budget. Ordinary Windows results
+    # must neither suppress CDP work nor give it a second full budget.
+    pending = [(profile, queue[index]) for index in range(max(map(len, queues.values()), default=0))
+               for profile, queue in queues.items() if index < len(queue)]
+    chosen = pending[:MAX_DISPATCH]
+    deferred = max(0, len(pending) - MAX_DISPATCH)
+    dry_run = os.environ.get("DRY_RUN", "false") == "true"
+    for profile, candidate in chosen:
+        if dry_run:
+            print(f"Selected {profile} {candidate.repository}@{candidate.head}")
+            continue
+        workflow = PROFILES[profile][0]
+        api("POST", f"/repos/{own_repo}/actions/workflows/{workflow}/dispatches", own,
             {"ref": ref, "inputs": candidate.inputs()})
-        print(f"Dispatched {candidate.repository}@{candidate.head[:12]}")
+        print(f"Dispatched {profile} {candidate.repository}@{candidate.head[:12]}")
 
-    print(f"repos={len(selected) - len(unreadable)} new-ready-heads={len(candidates)} selected={len(chosen)} deferred={deferred} dry-run={dry_run}")
+    print(f"repos={repo_count - len(unreadable)} new-ready-heads={len(pending)} selected={len(chosen)} deferred={deferred} dry-run={dry_run}")
     for repo, code in unreadable:
         print(f"::error::Cannot read {owner}/{repo} Ready PR metadata (HTTP {code}). "
               "HOSHIVEL_CI_TOKEN needs repository access with Contents: read and Pull requests: read.")
@@ -351,6 +381,34 @@ def selftest() -> int:
             except ValueError:
                 continue
             raise AssertionError(f"應該拒絕：{bad}")
+        profile_targets = {"windows": ["hoshi-data", "ShatteredRealms"],
+                           "enabled_windows": ["hoshi-data"],
+                           "cdp_windows": ["ShatteredRealms"],
+                           "enabled_cdp_windows": ["ShatteredRealms"]}
+        path.write_text(json.dumps(profile_targets), encoding="utf-8")
+        assert load_targets(path, profile="cdp-windows") == ["ShatteredRealms"]
+        assert load_targets(path, enabled=True, profile="cdp-windows") == ["ShatteredRealms"]
+        assert check("ShatteredRealms", a, b, c, "7", path, profile="cdp-windows") is None
+        assert check("hoshi-data", a, b, c, "7", path, profile="cdp-windows")
+        for change in ({"cdp_windows": ["hoshi-data"]},
+                       {"cdp_windows": ["ShatteredRealms", "ShatteredRealms"]},
+                       {"cdp_windows": ["ShatteredRealms\n"]},
+                       {"enabled_cdp_windows": ["hoshi-data"]},
+                       {"enabled_cdp_windows": ["ShatteredRealms", "ShatteredRealms"]}):
+            path.write_text(json.dumps({**profile_targets, **change}), encoding="utf-8")
+            try:
+                load_targets(path, enabled=True, profile="cdp-windows")
+            except ValueError:
+                continue
+            raise AssertionError("unsupported CDP allowlist was accepted")
+        try:
+            load_targets(path, profile="unknown")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("unknown profile was accepted")
+        path.write_text(json.dumps({"windows": ["hoshi-data"]}), encoding="utf-8")
+        assert load_targets(path, enabled=True, profile="cdp-windows") == []
 
     load_targets()  # the real list parses
     pr = {"state": "open", "draft": False, "number": 7,
@@ -472,7 +530,7 @@ def selftest() -> int:
         os.environ.update({"GITHUB_REPOSITORY": "Hoshivel/hoshi-ci", "GITHUB_REPOSITORY_OWNER": "Hoshivel",
                            "GITHUB_REF": "refs/heads/main", "GITHUB_REF_NAME": "main",
                            "SOURCE_TOKEN": "source", "GH_TOKEN": "own", "MANUAL_REPO": "hoshi-data",
-                           "MANUAL_PR": "7", "DRY_RUN": "false"})
+                           "MANUAL_PR": "7", "MANUAL_PROFILE": "", "DRY_RUN": "false"})
         with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()) as output:
             os.environ["GITHUB_OUTPUT"] = str(Path(tmp) / "output")
             assert admit("hoshi-data", a, b, c, "7") == 0
@@ -502,6 +560,155 @@ def selftest() -> int:
         api = saved
         os.environ.clear()
         os.environ.update(saved_environment)
+
+    # Exercise both routes through the real provenance and selection code.
+    # Histories are separate even when the repository and Ready head match.
+    from unittest.mock import patch
+    with tempfile.TemporaryDirectory() as tmp:
+        profile_path = Path(tmp) / "targets.json"
+        profile_path.write_text(json.dumps({
+            "windows": ["ShatteredRealms", "hoshi-data"],
+            "enabled_windows": ["ShatteredRealms", "hoshi-data"],
+            "cdp_windows": ["ShatteredRealms"],
+            "enabled_cdp_windows": ["ShatteredRealms"],
+        }), encoding="utf-8")
+        real_load_targets = load_targets
+
+        def fixture_targets(path=profile_path, *, enabled=False, profile="windows"):
+            return real_load_targets(profile_path, enabled=enabled, profile=profile)
+
+        def fixture_pr(repo, number, head, merge):
+            item = copy.deepcopy(original)
+            item.update(number=number, merge_commit_sha=merge)
+            item["head"].update(sha=head, repo={"full_name": f"Hoshivel/{repo}"})
+            item["base"].update(repo={"full_name": f"Hoshivel/{repo}"})
+            return item
+
+        fixtures = {("ShatteredRealms", 7): fixture_pr("ShatteredRealms", 7, a, c),
+                    ("ShatteredRealms", 8): fixture_pr("ShatteredRealms", 8, d, "f" * 40),
+                    ("hoshi-data", 9): fixture_pr("hoshi-data", 9, e, "1" * 40)}
+        histories = {"windows.yml": [], "cdp-windows.yml": []}
+        posts = []
+        reads = []
+        workflow_reads = []
+
+        def multi_api(method, path, token, body=None):
+            if "/actions/workflows/" in path:
+                workflow = path.split("/actions/workflows/", 1)[1].split("/", 1)[0]
+                assert workflow in histories, workflow
+                assert token == "own", "source token must not dispatch public work"
+                if method == "POST":
+                    assert body["ref"] == "main"
+                    posts.append((workflow, copy.deepcopy(body)))
+                    profile = "cdp-windows" if workflow == "cdp-windows.yml" else "windows"
+                    inputs = body["inputs"]
+                    histories[workflow].append({"display_title": title(inputs["repo"], inputs["sha"], profile)})
+                    return None
+                assert method == "GET"
+                workflow_reads.append(workflow)
+                return {"workflow_runs": copy.deepcopy(histories[workflow])}
+            assert method == "GET" and token == "source"
+            reads.append(path)
+            repo = path.split("/")[3]
+            if "pulls?" in path:
+                return [item for (source_repo, _), item in fixtures.items() if source_repo == repo]
+            if "/pulls/" in path:
+                return fixtures[(repo, int(path.rsplit("/", 1)[1]))]
+            if path.endswith("/git/ref/heads/main"):
+                return {"ref": "refs/heads/main", "object": {"type": "commit", "sha": b}}
+            if "/git/commits/" in path:
+                merge = path.rsplit("/", 1)[1]
+                item = next(item for (source_repo, _), item in fixtures.items()
+                            if source_repo == repo and item["merge_commit_sha"] == merge)
+                return {"sha": merge, "parents": [{"sha": b}, {"sha": item["head"]["sha"]}]}
+            raise AssertionError("unexpected profile API path")
+
+        environment = {"GITHUB_REPOSITORY": "Hoshivel/hoshi-ci", "GITHUB_REPOSITORY_OWNER": "Hoshivel",
+                       "GITHUB_REF": "refs/heads/main", "GITHUB_REF_NAME": "main",
+                       "SOURCE_TOKEN": "source", "GH_TOKEN": "own", "MANUAL_REPO": "",
+                       "MANUAL_PR": "", "MANUAL_PROFILE": "", "DRY_RUN": "false",
+                       "GITHUB_OUTPUT": str(Path(tmp) / "output")}
+        with patch.object(sys.modules[__name__], "api", multi_api), \
+             patch.object(sys.modules[__name__], "load_targets", fixture_targets), \
+             patch.dict(os.environ, environment, clear=True), \
+             contextlib.redirect_stdout(io.StringIO()) as output:
+            # A result from the other route, even in this workflow's history,
+            # must not suppress the intended work. Titles must match exactly.
+            histories["windows.yml"] = [{"display_title": title("ShatteredRealms", a, "cdp-windows")}]
+            histories["cdp-windows.yml"] = [
+                {"display_title": title("ShatteredRealms", a)},
+                {"display_title": title("ShatteredRealms", a, "cdp-windows") + "\n"},
+            ]
+            assert seen_runs("Hoshivel/hoshi-ci", "own") == set()
+            assert seen_runs("Hoshivel/hoshi-ci", "own", "cdp-windows") == set()
+            histories["windows.yml"] = [{"display_title": title("ShatteredRealms", a), "conclusion": "failure"}]
+            assert seen_runs("Hoshivel/hoshi-ci", "own") == {("ShatteredRealms", a)}
+            assert seen_runs("Hoshivel/hoshi-ci", "own", "cdp-windows") == set()
+            histories["windows.yml"].clear()
+            histories["cdp-windows.yml"].clear()
+
+            # One aggregate budget admits one pending job from each route;
+            # duplicates within one route do not consume another slot.
+            fixtures[("ShatteredRealms", 10)] = fixture_pr("ShatteredRealms", 10, a, c)
+            assert dispatch() == 0
+            assert [workflow for workflow, _ in posts] == ["windows.yml", "cdp-windows.yml"]
+            sr_frozen = Candidate("ShatteredRealms", 7, a, b, c)
+            assert all(body == {"ref": "main", "inputs": sr_frozen.inputs()} for _, body in posts)
+            assert "selected=2 deferred=3" in output.getvalue()
+            assert len(posts) == MAX_DISPATCH == 2
+            assert dispatch() == 0
+            assert len(posts) == 4
+            assert [workflow for workflow, _ in posts[2:]] == ["windows.yml", "cdp-windows.yml"]
+            assert all(body["inputs"]["sha"] == d for _, body in posts[2:])
+            assert dispatch() == 0
+            assert len(posts) == 5 and posts[-1][1]["inputs"]["repo"] == "hoshi-data"
+            assert dispatch() == 0 and len(posts) == 5
+            identities = [(workflow, body["inputs"]["repo"], body["inputs"]["sha"]) for workflow, body in posts]
+            assert len(set(identities)) == len(identities)
+
+            # Before pilot enablement the new workflow may not exist on main.
+            # Disabled profiles must not require its history to be readable.
+            settings = json.loads(profile_path.read_text(encoding="utf-8"))
+            settings["enabled_cdp_windows"] = []
+            profile_path.write_text(json.dumps(settings), encoding="utf-8")
+            workflow_reads.clear()
+            assert dispatch() == 0 and len(posts) == 5
+            assert workflow_reads == ["windows.yml"]
+
+            # A named CDP pilot uses only its own workflow and the same exact
+            # PR/head/base/merge identity later rechecked by worker admission.
+            histories["cdp-windows.yml"].clear()
+            posts.clear()
+            os.environ.update(MANUAL_REPO="ShatteredRealms", MANUAL_PR="7", MANUAL_PROFILE="cdp-windows")
+            assert dispatch() == 0
+            assert posts == [("cdp-windows.yml", {"ref": "main", "inputs": sr_frozen.inputs()})]
+            assert main(["admit", "--profile", "cdp-windows", "--repo", "ShatteredRealms",
+                         "--sha", a, "--base", b, "--merge", c, "--pr", "7"]) == 0
+            item = fixtures[("ShatteredRealms", 7)]
+            for key, value in (("draft", True), ("state", "closed"), ("merge_commit_sha", "2" * 40)):
+                previous = item[key]
+                item[key] = value
+                assert main(["admit", "--profile", "cdp-windows", "--repo", "ShatteredRealms",
+                             "--sha", a, "--base", b, "--merge", c, "--pr", "7"]) == 1
+                item[key] = previous
+            item["head"]["sha"] = d
+            assert admit("ShatteredRealms", a, b, c, "7", "cdp-windows") == 1
+            item["head"]["sha"] = a
+            assert Path(os.environ["GITHUB_OUTPUT"]).read_text() == (
+                "allowed=true\nallowed=false\nallowed=false\nallowed=false\nallowed=false\n")
+
+            histories["cdp-windows.yml"].clear()
+            os.environ["DRY_RUN"] = "true"
+            assert dispatch() == 0 and len(posts) == 1
+            assert "Selected cdp-windows" in output.getvalue()
+            reads.clear()
+            os.environ.update(MANUAL_REPO="hoshi-data", DRY_RUN="false")
+            assert main([]) == 1 and not reads and len(posts) == 1
+            assert main(["admit", "--profile", "cdp-windows", "--repo", "hoshi-data",
+                         "--sha", a, "--base", b, "--merge", c, "--pr", "7"]) == 1
+            assert not reads
+            os.environ.update(MANUAL_REPO="ShatteredRealms", MANUAL_PROFILE="unknown")
+            assert main([]) == 1 and not reads and len(posts) == 1
     print("dispatch.py selftest：全部通過")
     return 0
 
@@ -515,6 +722,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="mode")
     for mode in ("check", "admit"):
         command = sub.add_parser(mode)
+        command.add_argument("--profile", choices=PROFILES, default="windows")
         for argument in ("repo", "sha", "base", "merge", "pr"):
             command.add_argument(f"--{argument}", required=True)
     sub.add_parser("selftest")
@@ -523,14 +731,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "selftest":
         return selftest()
     if args.mode == "check":
-        reason = check(args.repo, args.sha, args.base, args.merge, args.pr)
+        reason = check(args.repo, args.sha, args.base, args.merge, args.pr, profile=args.profile)
         if reason:
             print(f"::error::{reason}")
             return 1
         return 0
     try:
         if args.mode == "admit":
-            return admit(args.repo, args.sha, args.base, args.merge, args.pr)
+            return admit(args.repo, args.sha, args.base, args.merge, args.pr, args.profile)
         return dispatch()
     except SourceReadError as error:
         print(f"::error::Source Ready PR metadata could not be read (HTTP {error.status}). "

@@ -1,5 +1,14 @@
 {
-  "enabled_windows": ["ShatteredRealms", "hoshi-admin", "hoshi-data", "hoshi-deploy", "hoshi-identity", "hoshi-mail", "hoshi-platform-sdk", "hoshi-svc"],
+  "enabled_windows": [
+    "ShatteredRealms",
+    "hoshi-admin",
+    "hoshi-data",
+    "hoshi-deploy",
+    "hoshi-identity",
+    "hoshi-mail",
+    "hoshi-platform-sdk",
+    "hoshi-svc"
+  ],
   "windows": [
     "ShatteredRealms",
     "hoshi-admin",
@@ -9,5 +18,9 @@
     "hoshi-mail",
     "hoshi-platform-sdk",
     "hoshi-svc"
-  ]
+  ],
+  "cdp_windows": [
+    "ShatteredRealms"
+  ],
+  "enabled_cdp_windows": []
 }
