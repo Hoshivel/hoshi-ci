@@ -86,6 +86,7 @@ class Step:
     script: str
     env: dict[str, str]
     cwd: str
+    preserve_exit_code: bool = False
 
 
 @dataclass
@@ -294,6 +295,7 @@ def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan
             script=run,
             env={str(k): env_value(v) for k, v in step_env.items()},
             cwd=cwd,
+            preserve_exit_code=profile == "guides-windows",
         ))
 
     if profile == "windows" and go_version_file is None:
@@ -362,6 +364,10 @@ def command(step: Step, scratch: Path, index: int) -> list[str]:
         return [git_bash(), "--noprofile", "--norc", "-eo", "pipefail", path.as_posix()]
     path = scratch / f"step{index}.ps1"
     path.write_bytes(b"\xef\xbb\xbf" + pwsh_script(step.script).encode("utf-8"))
+    if step.preserve_exit_code:
+        # -Command normalizes a called script's nonzero status to 1. The
+        # closed guide profile uses numeric status to identify failed cases.
+        return [pwsh(), "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(path)]
     return [pwsh(), "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", f". '{path}'"]
 
 
@@ -612,6 +618,8 @@ def selftest() -> int:
     assert guides_plan.python_version == "3.12"
     assert guides_plan.go_version_file is None and guides_plan.node_version is None
     assert guides_plan.timeout_minutes == 5 and len(guides_plan.steps) == 1
+    assert guides_plan.steps[0].preserve_exit_code
+    assert not any(step.preserve_exit_code for step in plan.steps + cdp_plan.steps)
     assert guides_plan.steps[0].shell == "pwsh" and guides_plan.steps[0].cwd == "."
     assert guides_plan.notes == []
     try:
@@ -744,6 +752,17 @@ def selftest() -> int:
         "::error::", "# ", "go: ", "--- FAIL: Test/", "FAIL ", "::warning::"))) + "); sys.exit(17)"
     with tempfile.TemporaryDirectory() as folder:
         work = Path(folder)
+        with patch.object(sys.modules[__name__], "pwsh", return_value="pwsh"):
+            ordinary = Step("Step 1", "pwsh", "exit 65", {}, ".")
+            diagnostic = Step("Step 1", "pwsh", "exit 65", {}, ".", preserve_exit_code=True)
+            assert command(ordinary, work, 1)[-2] == "-Command"
+            assert command(diagnostic, work, 1)[-2:] == ["-File", str(work / "step1.ps1")]
+            assert (work / "step1.ps1").read_text(encoding="utf-8-sig") == pwsh_script("exit 65")
+        if shutil.which("pwsh"):
+            for preserve, code, expected in ((False, 65, 1), (True, 65, 65), (True, 0, 0)):
+                native = Step("Step 1", "pwsh", f"exit {code}", {}, ".", preserve_exit_code=preserve)
+                actual = subprocess.run(command(native, work, 1), cwd=work, capture_output=True, timeout=20)
+                assert actual.returncode == expected, "native PowerShell exit status changed"
         summary = work / "summary.md"
         for module, node, python in (("go.mod", None, None), (None, "22", None), (None, None, "3.12")):
             public = io.StringIO()
