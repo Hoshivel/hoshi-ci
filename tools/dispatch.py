@@ -40,7 +40,9 @@ DEFAULT_BRANCH = "main"
 PROFILES = {
     "windows": (WORKFLOW, "Windows", "windows", "enabled_windows"),
     "cdp-windows": ("cdp-windows.yml", "Windows CDP", "cdp_windows", "enabled_cdp_windows"),
+    "guides-windows": ("guides-windows.yml", "Windows Guides", "guides_windows", "enabled_guides_windows"),
 }
+STRICT_PROFILES = frozenset({"cdp-windows", "guides-windows"})
 
 REPO = re.compile(r"^[A-Za-z0-9._-]+$")
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -81,16 +83,20 @@ def load_targets(path: Path = TARGETS, *, enabled: bool = False,
         raise ValueError("unknown execution profile")
     _, _, key, enabled_key = PROFILES[profile]
     document = json.loads(path.read_text(encoding="utf-8"))
-    repos = document.get(key, [] if profile == "cdp-windows" else None)
+    repos = document.get(key, [] if profile != "windows" else None)
     if not isinstance(repos, list) or (profile == "windows" and not repos) or not all(isinstance(r, str) and REPO.fullmatch(r) for r in repos):
         raise ValueError("invalid execution profile repository list")
     if profile == "cdp-windows" and any(repo != "ShatteredRealms" for repo in repos):
         raise ValueError("CDP Windows only supports ShatteredRealms")
+    if profile == "guides-windows" and any(repo != "workspace" for repo in repos):
+        raise ValueError("Guides Windows only supports workspace")
     if len(set(repos)) != len(repos):
         raise ValueError(f"{path.name} 的 windows 有重複")
+    active = document.get(enabled_key, [])
+    if profile == "guides-windows" and active != []:
+        raise ValueError("Guides Windows must remain manual-only")
     if not enabled:
         return repos
-    active = document.get(enabled_key, [])
     if not isinstance(active, list) or any(r not in repos for r in active) or len(set(active)) != len(active):
         raise ValueError("invalid enabled Windows list")
     return active
@@ -257,9 +263,9 @@ def snapshot_current(owner: str, candidate: Candidate, token: str,
     if not eligible(owner, repo, pr) or pr["number"] != candidate.number or pr["head"]["sha"] != candidate.head:
         return False
     current_base = main_tip(source, token)
-    # CDP accepts only the exact merge GitHub currently associates with this
-    # Ready PR and current main. Two parent SHAs alone cannot identify its tree.
-    if profile == "cdp-windows" and (current_base != candidate.base
+    # New strict profiles accept only GitHub's current Ready PR merge and main.
+    # Two parent SHAs alone cannot identify the tree that GitHub authorized.
+    if profile in STRICT_PROFILES and (current_base != candidate.base
             or pr.get("merge_commit_sha") != candidate.merge or pr.get("mergeable") is not True):
         return False
     if not is_ancestor(source, candidate.base, current_base, token):
@@ -310,6 +316,8 @@ def dispatch() -> int:
     requested = os.environ.get("MANUAL_PROFILE", "")
     if requested and requested not in PROFILES:
         raise ValueError("unknown execution profile")
+    if requested == "guides-windows" and (not manual or not manual_pr):
+        raise ValueError("Guides Windows requires an explicit repository and PR")
     profiles = [requested or "windows"] if requested or manual else list(PROFILES)
     repo_count = 0
     for profile in profiles:
@@ -324,7 +332,7 @@ def dispatch() -> int:
         for repo in selected:
             try:
                 ready = ready_candidates(owner, repo, source, seen, int(manual_pr) if manual_pr else None)
-                if profile == "cdp-windows":
+                if profile in STRICT_PROFILES:
                     ready = [candidate for candidate in ready
                              if snapshot_current(owner, candidate, source, profile)]
                 candidates += ready
@@ -421,6 +429,24 @@ def selftest() -> int:
             raise AssertionError("unknown profile was accepted")
         path.write_text(json.dumps({"windows": ["hoshi-data"]}), encoding="utf-8")
         assert load_targets(path, enabled=True, profile="cdp-windows") == []
+        guides_targets = {"windows": ["hoshi-data"], "guides_windows": ["workspace"],
+                         "enabled_guides_windows": []}
+        path.write_text(json.dumps(guides_targets), encoding="utf-8")
+        assert load_targets(path, profile="guides-windows") == ["workspace"]
+        assert load_targets(path, enabled=True, profile="guides-windows") == []
+        assert check("workspace", a, b, c, "11", path, profile="guides-windows") is None
+        assert check("ShatteredRealms", a, b, c, "11", path, profile="guides-windows")
+        assert check("workspace", a, b, c, "11", path)
+        for change in ({"guides_windows": ["hoshi-data"]}, {"guides_windows": ["workspace", "workspace"]},
+                       {"guides_windows": ["workspace\n"]}, {"enabled_guides_windows": ["workspace"]},
+                       {"enabled_guides_windows": ["hoshi-data"]}, {"enabled_guides_windows": True}):
+            path.write_text(json.dumps({**guides_targets, **change}), encoding="utf-8")
+            for enabled in (False, True):
+                try:
+                    load_targets(path, enabled=enabled, profile="guides-windows")
+                except ValueError:
+                    continue
+                raise AssertionError("unsupported or automatic Guides allowlist was accepted")
 
     load_targets()  # the real list parses
     pr = {"state": "open", "draft": False, "number": 7,
@@ -583,6 +609,8 @@ def selftest() -> int:
             "enabled_windows": ["ShatteredRealms", "hoshi-data"],
             "cdp_windows": ["ShatteredRealms"],
             "enabled_cdp_windows": ["ShatteredRealms"],
+            "guides_windows": ["workspace"],
+            "enabled_guides_windows": [],
         }), encoding="utf-8")
         real_load_targets = load_targets
 
@@ -598,8 +626,9 @@ def selftest() -> int:
 
         fixtures = {("ShatteredRealms", 7): fixture_pr("ShatteredRealms", 7, a, c),
                     ("ShatteredRealms", 8): fixture_pr("ShatteredRealms", 8, d, "f" * 40),
-                    ("hoshi-data", 9): fixture_pr("hoshi-data", 9, e, "1" * 40)}
-        histories = {"windows.yml": [], "cdp-windows.yml": []}
+                    ("hoshi-data", 9): fixture_pr("hoshi-data", 9, e, "1" * 40),
+                    ("workspace", 11): fixture_pr("workspace", 11, a, c)}
+        histories = {"windows.yml": [], "cdp-windows.yml": [], "guides-windows.yml": []}
         posts = []
         reads = []
         workflow_reads = []
@@ -614,7 +643,7 @@ def selftest() -> int:
                 if method == "POST":
                     assert body["ref"] == "main"
                     posts.append((workflow, copy.deepcopy(body)))
-                    profile = "cdp-windows" if workflow == "cdp-windows.yml" else "windows"
+                    profile = next(key for key, values in PROFILES.items() if values[0] == workflow)
                     inputs = body["inputs"]
                     histories[workflow].append({"display_title": title(inputs["repo"], inputs["sha"], profile)})
                     return None
@@ -760,6 +789,55 @@ def selftest() -> int:
             assert not reads
             os.environ.update(MANUAL_REPO="ShatteredRealms", MANUAL_PROFILE="unknown")
             assert main([]) == 1 and not reads and len(posts) == 1
+
+            # Guides has its own frozen-source admission and history, but no
+            # schedule activation. Even a configured enabled list is invalid.
+            os.environ.update(environment)
+            posts.clear()
+            reads.clear()
+            workflow_reads.clear()
+            assert dispatch() == 0
+            assert "guides-windows.yml" not in workflow_reads
+            assert not any("/workspace/" in path for path in reads)
+            guides_frozen = Candidate("workspace", 11, a, b, c)
+            assert snapshot_current("Hoshivel", guides_frozen, "source", "guides-windows")
+            live_tip = d
+            assert not snapshot_current("Hoshivel", guides_frozen, "source", "guides-windows")
+            live_tip = b
+            assert not snapshot_current("Hoshivel", Candidate("workspace", 11, a, b, fabricated_sha),
+                                        "source", "guides-windows")
+            posts.clear()
+            reads.clear()
+            workflow_reads.clear()
+            os.environ.update(MANUAL_REPO="workspace", MANUAL_PR="11", MANUAL_PROFILE="guides-windows")
+            histories["guides-windows.yml"] = [
+                {"display_title": title("workspace", a)},
+                {"display_title": title("workspace", a, "cdp-windows")},
+                {"display_title": title("workspace", a, "guides-windows") + "\n"},
+            ]
+            assert seen_runs("Hoshivel/hoshi-ci", "own", "guides-windows") == set()
+            workflow_reads.clear()
+            assert dispatch() == 0
+            assert posts == [("guides-windows.yml", {"ref": "main", "inputs": guides_frozen.inputs()})]
+            assert workflow_reads == ["guides-windows.yml"]
+            assert main(["admit", "--profile", "guides-windows", "--repo", "workspace", "--sha", a,
+                         "--base", b, "--merge", c, "--pr", "11"]) == 0
+            item = fixtures[("workspace", 11)]
+            for key, value in (("draft", True), ("state", "closed"), ("merge_commit_sha", fabricated_sha)):
+                previous = item[key]
+                item[key] = value
+                assert admit("workspace", a, b, c, "11", "guides-windows") == 1
+                item[key] = previous
+            reads.clear()
+            workflow_reads.clear()
+            os.environ["MANUAL_REPO"] = "ShatteredRealms"
+            assert main([]) == 1 and not reads and not workflow_reads
+            os.environ.update(MANUAL_REPO="workspace", MANUAL_PR="")
+            assert main([]) == 1 and not reads and not workflow_reads
+            settings["enabled_guides_windows"] = ["workspace"]
+            profile_path.write_text(json.dumps(settings), encoding="utf-8")
+            os.environ.update(MANUAL_PR="11")
+            assert main([]) == 1 and not reads and not workflow_reads
     print("dispatch.py selftest：全部通過")
     return 0
 

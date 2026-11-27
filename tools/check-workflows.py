@@ -123,8 +123,76 @@ def check_doc(name: str, doc: object) -> list[str]:
                 options = step.get("with") or {}
                 if "cache" in options or options.get("package-manager-cache") is not False:
                     problems.append(f"{name}：拿得到 {TOKEN}，setup-node 必須關閉套件快取")
+            if action == "actions/setup-python" and "cache" in (step.get("with") or {}):
+                problems.append(f"{name}：拿得到 {TOKEN}，setup-python 不得啟用套件快取")
             if action == "actions/checkout" and {"repository", "token"} & set(step.get("with") or {}):
                 problems.append(f"{name}：以 actions/checkout 取別的倉庫，commit 標題會進公開日誌")
+    if name == "guides-windows.yml":
+        problems += check_guides_worker(doc)
+    return problems
+
+
+def check_guides_worker(doc: dict) -> list[str]:
+    """Keep the named manual worker's provenance and sparse source boundary."""
+    problems = []
+    jobs = doc.get("jobs") or {}
+    if events(doc) != {"workflow_dispatch"} or set(jobs) != {"eligibility", "verify"}:
+        return ["guides-windows.yml：只接受具名手動工作與兩層來源核對"]
+    eligibility = jobs["eligibility"]
+    verify = jobs["verify"]
+    if not isinstance(eligibility, dict) or not isinstance(verify, dict):
+        return ["guides-windows.yml：無效工作"]
+    for scope in (doc, eligibility, verify):
+        if any(f"secrets.{TOKEN}" in value for value in strings(scope.get("env") or {})):
+            problems.append("guides-windows.yml：私有憑證只可存在來源核對與取得來源的步驟環境")
+    if (verify.get("runs-on") != "windows-latest" or verify.get("needs") != "eligibility"
+            or verify.get("if") != "needs.eligibility.outputs.allowed == 'true'"):
+        problems.append("guides-windows.yml：Windows 工作必須依賴來源核對成功")
+    steps = verify.get("steps") or []
+    eligibility_steps = eligibility.get("steps") or []
+    all_steps = eligibility_steps + steps
+    if len(eligibility_steps) != 2 or len(steps) != 8 or any(not isinstance(step, dict) for step in all_steps):
+        return problems + ["guides-windows.yml：不接受額外或遺漏步驟"]
+    admissions = [step for step in all_steps if isinstance(step, dict)
+                  and "tools/dispatch.py admit" in str(step.get("run", ""))]
+    if len(admissions) != 2 or any("--profile guides-windows" not in step["run"]
+                                  or (step.get("env") or {}).get("SOURCE_TOKEN") != "${{ secrets.HOSHIVEL_CI_TOKEN }}"
+                                  for step in admissions):
+        problems.append("guides-windows.yml：兩層來源核對必須綁定具名 profile 與唯讀憑證")
+    if (eligibility.get("runs-on") != "ubuntu-latest" or eligibility_steps[1] not in admissions
+            or eligibility_steps[1].get("id") != "check" or steps[2] not in admissions
+            or steps[2].get("id") != "current"):
+        problems.append("guides-windows.yml：Linux 準入與 Windows 取得來源前核對必須各執行一次")
+    current_guard = "steps.current.outputs.allowed == 'true'"
+    if any(step.get("if") != current_guard for step in steps[3:]):
+        problems.append("guides-windows.yml：取得來源與執行必須依賴 Windows 當次核對成功")
+    python_steps = [(index, step) for index, step in enumerate(steps)
+                    if isinstance(step, dict) and str(step.get("uses", "")).startswith("actions/setup-python@")]
+    installers = [index for index, step in enumerate(steps)
+                  if isinstance(step, dict) and step.get("run") == "python -m pip install --disable-pip-version-check --quiet pyyaml==6.0.3"]
+    planners = [index for index, step in enumerate(steps)
+                if isinstance(step, dict) and step.get("run") == 'python ci/tools/run-job.py plan --profile guides-windows --src src --output "${GITHUB_OUTPUT}"']
+    runners = [index for index, step in enumerate(steps)
+               if isinstance(step, dict) and step.get("run") == "python ci/tools/run-job.py run --profile guides-windows --src src"]
+    if (len(python_steps) != 1 or python_steps[0][1].get("uses") != "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+            or python_steps[0][1].get("with") != {"python-version": "3.12"}
+            or len(installers) != 1 or len(planners) != 1 or len(runners) != 1
+            or not python_steps[0][0] < installers[0] < planners[0] < runners[0]):
+        problems.append("guides-windows.yml：固定 Python 必須先於相依安裝、計畫與執行")
+    fetches = [step for step in steps if isinstance(step, dict) and "git init -q src" in str(step.get("run", ""))]
+    sparse = "printf '/.github/workflows/windows-guides.yml\\n/tools/check-agent-rules.py\\n/tools/_console.py\\n' > src/.git/info/sparse-checkout"
+    if (len(fetches) != 1 or fetches[0] != steps[3]
+            or (fetches[0].get("env") or {}).get("TOKEN") != "${{ secrets.HOSHIVEL_CI_TOKEN }}"
+            or not all(snippet in fetches[0]["run"] for snippet in (
+                "git -C src config core.sparseCheckout true", "git -C src config core.sparseCheckoutCone false",
+                "git -C src config remote.origin.promisor true", "git -C src config remote.origin.partialclonefilter blob:none",
+                sparse, "fetch -q --filter=blob:none --depth=1 --no-tags", 'checkout -q FETCH_HEAD > "${RUNNER_TEMP}/source-checkout.log" 2>&1'))):
+        problems.append("guides-windows.yml：來源只可在憑證步驟以固定 sparse 清單取得")
+    for step in all_steps:
+        if not isinstance(step, dict):
+            continue
+        if any(f"secrets.{TOKEN}" in value for value in strings(step)) and step not in admissions + fetches:
+            problems.append("guides-windows.yml：來源執行不得持有私有憑證")
     return problems
 
 
@@ -152,6 +220,7 @@ def selftest() -> int:
     assert check_doc("good", good) == [], check_doc("good", good)
     node = {"uses": f"actions/setup-node@{sha}", "with": {"node-version": "22", "package-manager-cache": False}}
     good["jobs"]["j"]["steps"].append(node)
+    good["jobs"]["j"]["steps"].append({"uses": f"actions/setup-python@{sha}", "with": {"python-version": "3.12"}})
     assert check_doc("node without cache", good) == []
     assert check_doc("bare on", yaml.safe_load("on: push\njobs: {}\n")) == []
 
@@ -168,9 +237,11 @@ def selftest() -> int:
         "快取": lambda d: d["jobs"]["j"]["steps"].append({"uses": f"actions/cache/restore@{sha}"}),
         "artifact": lambda d: d["jobs"]["j"]["steps"].append({"uses": f"actions/upload-artifact@{sha}"}),
         "setup-go 快取": lambda d: d["jobs"]["j"]["steps"][2].update({"with": {}}),
-        "setup-node 自動快取": lambda d: d["jobs"]["j"]["steps"][-1]["with"].pop("package-manager-cache"),
-        "setup-node 啟用快取": lambda d: d["jobs"]["j"]["steps"][-1]["with"].update({"cache": "npm"}),
-        "setup-node 開啟自動快取": lambda d: d["jobs"]["j"]["steps"][-1]["with"].update({"package-manager-cache": True}),
+        "setup-node 自動快取": lambda d: d["jobs"]["j"]["steps"][-2]["with"].pop("package-manager-cache"),
+        "setup-node 啟用快取": lambda d: d["jobs"]["j"]["steps"][-2]["with"].update({"cache": "npm"}),
+        "setup-node 開啟自動快取": lambda d: d["jobs"]["j"]["steps"][-2]["with"].update({"package-manager-cache": True}),
+        "setup-python 快取": lambda d: d["jobs"]["j"]["steps"][-1]["with"].update({"cache": "pip"}),
+        "setup-python 空快取宣告": lambda d: d["jobs"]["j"]["steps"][-1]["with"].update({"cache": ""}),
         "checkout 別的倉庫": lambda d: d["jobs"]["j"]["steps"][0]["with"].update({"repository": "o/private"}),
         "別的 secret": lambda d: d["jobs"]["j"].update({"env": {"X": "${{ secrets.DEPLOY_KEY }}"}}),
         "動態 secret": lambda d: d["jobs"]["j"].update({"env": {"X": "${{ toJSON(secrets) }}"}}),
@@ -181,6 +252,30 @@ def selftest() -> int:
     }
     for what, mutate in rejected.items():
         assert check_doc(what, variant(mutate)), f"應該拒絕：{what}"
+
+    import copy
+    guides = yaml.safe_load((ROOT / ".github/workflows/guides-windows.yml").read_text(encoding="utf-8"))
+    assert check_doc("guides-windows.yml", guides) == []
+    for label, mutate in {
+        "missing admission token": lambda d: d["jobs"]["eligibility"]["steps"][1]["env"].pop("SOURCE_TOKEN"),
+        "missing fetch token": lambda d: d["jobs"]["verify"]["steps"][3]["env"].pop("TOKEN"),
+        "wrong source profile": lambda d: d["jobs"]["verify"]["steps"][2].update(run="python ci/tools/dispatch.py admit --profile windows"),
+        "wrong Python revision": lambda d: d["jobs"]["verify"]["steps"][4].update(uses=f"actions/setup-python@{sha}"),
+        "Python cache": lambda d: d["jobs"]["verify"]["steps"][4]["with"].update(cache="pip"),
+        "source receives token": lambda d: d["jobs"]["verify"]["steps"][-1].update(env={"TOKEN": "${{ secrets.HOSHIVEL_CI_TOKEN }}"}),
+        "full source checkout": lambda d: d["jobs"]["verify"]["steps"][3].update(run="git init -q src\ngit fetch -q --depth=1"),
+        "automatic trigger": lambda d: d[True].update(schedule=[{"cron": "1 * * * *"}]),
+        "workflow credential environment": lambda d: d.update(env={"TOKEN": "${{ secrets.HOSHIVEL_CI_TOKEN }}"}),
+        "job credential environment": lambda d: d["jobs"]["verify"].update(env={"TOKEN": "${{ secrets.HOSHIVEL_CI_TOKEN }}"}),
+        "Linux admission runner": lambda d: d["jobs"]["eligibility"].update({"runs-on": "windows-latest"}),
+        "Windows current check after fetch": lambda d: d["jobs"]["verify"]["steps"].__setitem__(slice(2, 4), d["jobs"]["verify"]["steps"][2:4][::-1]),
+        "unguarded source fetch": lambda d: d["jobs"]["verify"]["steps"][3].pop("if"),
+        "unguarded source run": lambda d: d["jobs"]["verify"]["steps"][-1].pop("if"),
+        "Python after installer": lambda d: d["jobs"]["verify"]["steps"].__setitem__(slice(4, 6), d["jobs"]["verify"]["steps"][4:6][::-1]),
+    }.items():
+        changed = copy.deepcopy(guides)
+        mutate(changed)
+        assert check_doc("guides-windows.yml", changed), label
 
     with tempfile.TemporaryDirectory() as tmp:
         assert check(Path(tmp)) == ["找不到任何 workflow"]
