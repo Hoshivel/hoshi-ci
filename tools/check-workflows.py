@@ -119,6 +119,10 @@ def check_doc(name: str, doc: object) -> list[str]:
                 problems.append(f"{name}：拿得到 {TOKEN}，卻用了 {action}")
             if action == "actions/setup-go" and (step.get("with") or {}).get("cache") is not False:
                 problems.append(f"{name}：拿得到 {TOKEN}，setup-go 卻沒有寫 cache: false")
+            if action == "actions/setup-node":
+                options = step.get("with") or {}
+                if "cache" in options or options.get("package-manager-cache") is not False:
+                    problems.append(f"{name}：拿得到 {TOKEN}，setup-node 必須關閉套件快取")
             if action == "actions/checkout" and {"repository", "token"} & set(step.get("with") or {}):
                 problems.append(f"{name}：以 actions/checkout 取別的倉庫，commit 標題會進公開日誌")
     return problems
@@ -146,6 +150,9 @@ def selftest() -> int:
         ]}},
     }
     assert check_doc("good", good) == [], check_doc("good", good)
+    node = {"uses": f"actions/setup-node@{sha}", "with": {"node-version": "22", "package-manager-cache": False}}
+    good["jobs"]["j"]["steps"].append(node)
+    assert check_doc("node without cache", good) == []
     assert check_doc("bare on", yaml.safe_load("on: push\njobs: {}\n")) == []
 
     def variant(mutate) -> dict:
@@ -161,6 +168,9 @@ def selftest() -> int:
         "快取": lambda d: d["jobs"]["j"]["steps"].append({"uses": f"actions/cache/restore@{sha}"}),
         "artifact": lambda d: d["jobs"]["j"]["steps"].append({"uses": f"actions/upload-artifact@{sha}"}),
         "setup-go 快取": lambda d: d["jobs"]["j"]["steps"][2].update({"with": {}}),
+        "setup-node 自動快取": lambda d: d["jobs"]["j"]["steps"][-1]["with"].pop("package-manager-cache"),
+        "setup-node 啟用快取": lambda d: d["jobs"]["j"]["steps"][-1]["with"].update({"cache": "npm"}),
+        "setup-node 開啟自動快取": lambda d: d["jobs"]["j"]["steps"][-1]["with"].update({"package-manager-cache": True}),
         "checkout 別的倉庫": lambda d: d["jobs"]["j"]["steps"][0]["with"].update({"repository": "o/private"}),
         "別的 secret": lambda d: d["jobs"]["j"].update({"env": {"X": "${{ secrets.DEPLOY_KEY }}"}}),
         "動態 secret": lambda d: d["jobs"]["j"].update({"env": {"X": "${{ toJSON(secrets) }}"}}),

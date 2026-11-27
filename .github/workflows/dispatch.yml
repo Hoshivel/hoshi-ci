@@ -15,11 +15,15 @@ on:
     # active 或手動成功不代表自然排程已觸發。依官方恢復入口更新 cron，
     # 仍須以 event=schedule 的實際 run 驗收；延遲時可具名手動補派，head 去重照常。
     # https://docs.github.com/en/actions/how-tos/troubleshoot-workflows#scheduled-workflow-stopped-running
-    - cron: "8,23,38,53 * * * *"
+    - cron: "11,26,41,56 * * * *"
   workflow_dispatch:
     inputs:
+      profile:
+        description: Optional windows or cdp-windows route; empty uses all enabled routes.
+        required: false
+        type: string
       repo:
-        description: Optional repository for a supervised pilot; empty uses enabled_windows.
+        description: Optional repository for a supervised pilot; empty uses enabled repositories for the selected routes.
         required: false
         type: string
       dry_run:
@@ -58,6 +62,7 @@ jobs:
           SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
           # 本倉庫自己的：派 run、讀 run 清單。
           GH_TOKEN: ${{ github.token }}
+          MANUAL_PROFILE: ${{ inputs.profile }}
           MANUAL_REPO: ${{ inputs.repo }}
           MANUAL_PR: ${{ inputs.pr }}
           DRY_RUN: ${{ inputs.dry_run }}

@@ -4,6 +4,13 @@
 以受控手動派工完成具名試跑，再加入 `enabled_windows` 並切換來源倉庫的自動 Windows
 工作，避免兩邊同時執行。
 
+`cdp_windows`／`enabled_cdp_windows` 獨立管理 `ShatteredRealms` 的 Windows CDP 路線。
+`cdp-windows.yml` 讀凍結來源自己的 CDP workflow 與 `lifecycle` job，只接受 Node 22，
+不下載 Go module 或 npm 套件。原始工作使用 Windows PowerShell 與原生程序 fixture，
+因此保留完整凍結樹及 Windows runner；Linux 結果不能代替 Windows 驗收。
+兩條路線各自去重，標題分別為 `Windows` 與 `Windows CDP`，每輪合計最多派兩項。
+排程交替選取兩條路線，未啟用的 CDP 路線不讀工作歷史。
+
 在這個公開倉庫的 runner 上，代跑 Hoshivel 私有倉庫的 Windows 原生驗證。
 
 ## 做什麼
@@ -46,8 +53,18 @@ insteadOf，不寫進設定檔；被驗證的程式碼在那之後才執行，�
 若 PR 讀取回傳 HTTP 403，須檢查此 token 的 **Pull requests: read** 與來源倉庫存取範圍；
 只有 Contents: read 能 clone，不足以通過 Ready PR 準入。
 
-拿得到它的兩支 workflow 只由排程與手動觸發。這些承諾由 `tools/check-workflows.py` 檢查，
+拿得到它的 workflow 只由排程與手動觸發。這些承諾由 `tools/check-workflows.py` 檢查，
 `CI` 每次都跑。
+
+CDP 工作只在來源核對與取得 commit 時使用唯讀 token，執行來源時不持有它。
+`setup-node` 明確關閉套件快取，來源輸出與步驟名稱沿用同一個抑制器，不上傳 artifact。
+
+CDP 啟用順序：先合併公開控制程式，將來源 `HOSHI_CI_CDP_WINDOWS` 設為
+`pilot:<PR>`，對該 Ready PR 手動派工。確認 `Ready PR admission`、
+`CDP lifecycle Windows` job 及同名來源步驟均成功，來源 hosted Windows 未配置，
+並核對 PR 編號、head、凍結 base／merge 及實際 checkout。通過後才加入
+`enabled_cdp_windows` 並把來源變數改為 `enabled`；回退先停用清單，再把來源變數設為
+`hosted` 並對受影響 PR 重跑全部工作。空綠燈或一般 Windows 結果不得作為 CDP 證據。
 
 ## 排程未觸發時
 
@@ -65,6 +82,7 @@ insteadOf，不寫進設定檔；被驗證的程式碼在那之後才執行，�
 gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f dry_run=true
 gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f repo=hoshi-identity
 gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f repo=hoshi-data -f pr=<PR 編號> -f dry_run=true
+gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f profile=cdp-windows -f repo=ShatteredRealms -f pr=<PR 編號>
 gh workflow run windows.yml -R Hoshivel/hoshi-ci -f repo=hoshi-data -f pr=<PR 編號> \
   -f sha=<40 字元 PR head> -f base=<40 字元凍結 base> -f merge=<40 字元凍結合併提交>
 gh run list -R Hoshivel/hoshi-ci -w windows.yml
