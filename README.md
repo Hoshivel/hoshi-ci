@@ -10,6 +10,11 @@
 因此保留完整凍結樹及 Windows runner；Linux 結果不能代替 Windows 驗收。
 兩條路線各自去重，標題分別為 `Windows` 與 `Windows CDP`，每輪合計最多派兩項。
 排程交替選取兩條路線，未啟用的 CDP 路線不讀工作歷史。
+CDP 的派工、runner 分配及來源取得前都要求凍結 base 仍等於目前 main，且 merge
+仍是 GitHub 為目前 Ready PR 回報的合併提交；過時的輸入拒絕執行。來源的 checkout／Node
+action revision 必須與公開控制端精確相符。main 前進後重試須重新讀取 PR 的 head、base
+與 GitHub merge，直接建立新的 `cdp-windows.yml` 工作；`gh run rerun` 沿用舊輸入，
+`dispatch.yml` 對相同 head 仍去重，均不會刷新已派工的來源。
 
 在這個公開倉庫的 runner 上，代跑 Hoshivel 私有倉庫的 Windows 原生驗證。
 
@@ -29,7 +34,7 @@
   `Ready PR admission` 與 `verify-windows` 兩個 job 均須實際成功，其中執行來源步驟的
   `verify-windows` step 也須成功，並保留來源倉庫其餘原有檢查的成功要求。
   派工成功、歷史 head 的綠燈或來源 Windows 的 skipped 都不能替代這些結果。
-  main 正常前進時，原工作仍對應同一份凍結合併樹。主線已不含凍結 base 時拒絕執行。
+  普通 Go Windows 路線在 main 正常前進時，原工作仍對應同一份凍結合併樹。主線已不含凍結 base 時拒絕執行。
   工作記錄凍結 base，因此能檢查它是否仍在 main 歷史；若主線改動保留該 base，
   無法從工作輸入判定其間是否曾改寫。
   一個 head 已有 run（不論結果，包括尚未執行驗證的 admission 失敗）就不會自動重派。
@@ -92,3 +97,10 @@ gh run list -R Hoshivel/hoshi-ci -w windows.yml
 與凍結 merge 的兩個父提交完全匹配等核對，不能任意指定一個 commit 執行。
 重試先保留原工作輸入；若 PR head 已變，改由新 head 派工。這裡不要求對私有倉庫的寫入權限，
 結果由上述精確提交的公開 run 提供。其餘測試與安全掃描沿用原私有工作流。
+
+CDP 刷新重試直接指定重新核對的身分：
+
+```sh
+gh workflow run cdp-windows.yml -R Hoshivel/hoshi-ci -f repo=ShatteredRealms -f pr=<PR 編號> \
+  -f sha=<目前 Ready head> -f base=<目前 main> -f merge=<GitHub 回報且雙親匹配的 merge>
+```

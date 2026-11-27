@@ -246,14 +246,22 @@ def seen_runs(own_repo: str, token: str, profile: str = "windows") -> set[tuple[
     raise ValueError("run history exceeds the complete-scan bound")
 
 
-def snapshot_current(owner: str, candidate: Candidate, token: str) -> bool:
+def snapshot_current(owner: str, candidate: Candidate, token: str,
+                     profile: str = "windows") -> bool:
     """Keep the frozen merge while rejecting closed, drafted or changed heads."""
+    if profile not in PROFILES:
+        raise ValueError("unknown execution profile")
     repo = candidate.repository
     source = f"/repos/{owner}/{repo}"
     pr = source_api(f"{source}/pulls/{candidate.number}", token)
     if not eligible(owner, repo, pr) or pr["number"] != candidate.number or pr["head"]["sha"] != candidate.head:
         return False
     current_base = main_tip(source, token)
+    # CDP accepts only the exact merge GitHub currently associates with this
+    # Ready PR and current main. Two parent SHAs alone cannot identify its tree.
+    if profile == "cdp-windows" and (current_base != candidate.base
+            or pr.get("merge_commit_sha") != candidate.merge or pr.get("mergeable") is not True):
+        return False
     if not is_ancestor(source, candidate.base, current_base, token):
         return False
     if current_base == candidate.base and (pr.get("merge_commit_sha") != candidate.merge or pr.get("mergeable") is not True):
@@ -271,7 +279,7 @@ def admit(repo: str, sha: str, base: str, merge: str, pr: str,
     if own != f"{owner}/hoshi-ci" or os.environ.get("GITHUB_REF") != "refs/heads/main":
         raise ValueError("worker requires its default branch")
     candidate = Candidate(repo, int(pr), sha, base, merge)
-    allowed = snapshot_current(owner, candidate, os.environ["SOURCE_TOKEN"])
+    allowed = snapshot_current(owner, candidate, os.environ["SOURCE_TOKEN"], profile)
     with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
         output.write("allowed=" + str(allowed).lower() + "\n")
     print("Ready PR head and frozen merge verified" if allowed else "Source changed or PR is not Ready; no source work")
@@ -315,7 +323,11 @@ def dispatch() -> int:
         candidates: list[Candidate] = []
         for repo in selected:
             try:
-                candidates += ready_candidates(owner, repo, source, seen, int(manual_pr) if manual_pr else None)
+                ready = ready_candidates(owner, repo, source, seen, int(manual_pr) if manual_pr else None)
+                if profile == "cdp-windows":
+                    ready = [candidate for candidate in ready
+                             if snapshot_current(owner, candidate, source, profile)]
+                candidates += ready
             except SourceReadError as err:
                 unreadable.append((repo, err.status))
         queues[profile] = select(candidates, seen, len(candidates))[0]
@@ -591,6 +603,8 @@ def selftest() -> int:
         posts = []
         reads = []
         workflow_reads = []
+        live_tip = b
+        extra_commits = {}
 
         def multi_api(method, path, token, body=None):
             if "/actions/workflows/" in path:
@@ -615,12 +629,17 @@ def selftest() -> int:
             if "/pulls/" in path:
                 return fixtures[(repo, int(path.rsplit("/", 1)[1]))]
             if path.endswith("/git/ref/heads/main"):
-                return {"ref": "refs/heads/main", "object": {"type": "commit", "sha": b}}
+                return {"ref": "refs/heads/main", "object": {"type": "commit", "sha": live_tip}}
             if "/git/commits/" in path:
                 merge = path.rsplit("/", 1)[1]
+                if merge in extra_commits:
+                    return extra_commits[merge]
                 item = next(item for (source_repo, _), item in fixtures.items()
                             if source_repo == repo and item["merge_commit_sha"] == merge)
                 return {"sha": merge, "parents": [{"sha": b}, {"sha": item["head"]["sha"]}]}
+            if "/compare/" in path:
+                assert path.endswith(f"/compare/{b}...{d}?per_page=1")
+                return {"status": "ahead", "base_commit": {"sha": b}, "merge_base_commit": {"sha": b}}
             raise AssertionError("unexpected profile API path")
 
         environment = {"GITHUB_REPOSITORY": "Hoshivel/hoshi-ci", "GITHUB_REPOSITORY_OWNER": "Hoshivel",
@@ -632,6 +651,39 @@ def selftest() -> int:
              patch.object(sys.modules[__name__], "load_targets", fixture_targets), \
              patch.dict(os.environ, environment, clear=True), \
              contextlib.redirect_stdout(io.StringIO()) as output:
+            sr_frozen = Candidate("ShatteredRealms", 7, a, b, c)
+            assert snapshot_current("Hoshivel", sr_frozen, "source", "cdp-windows")
+            live_tip = d
+            # A valid frozen merge remains compatible with ordinary Windows,
+            # while CDP requires GitHub's current main and merge binding.
+            assert snapshot_current("Hoshivel", sr_frozen, "source")
+            assert not snapshot_current("Hoshivel", sr_frozen, "source", "cdp-windows")
+            assert admit("ShatteredRealms", a, b, c, "7") == 0
+            assert admit("ShatteredRealms", a, b, c, "7", "cdp-windows") == 1
+            fabricated_sha = "9" * 40
+            extra_commits[fabricated_sha] = {
+                "sha": fabricated_sha, "parents": [{"sha": b}, {"sha": a}],
+                "tree": {"sha": "8" * 40},
+            }
+            fabricated = Candidate("ShatteredRealms", 7, a, b, fabricated_sha)
+            assert snapshot_current("Hoshivel", fabricated, "source")
+            assert not snapshot_current("Hoshivel", fabricated, "source", "cdp-windows")
+            assert admit("ShatteredRealms", a, b, fabricated_sha, "7", "cdp-windows") == 1
+            # The CDP dispatcher must reject stale snapshots for both named
+            # pilots and automatic ticks, before any worker is requested.
+            os.environ.update(MANUAL_REPO="ShatteredRealms", MANUAL_PR="7", MANUAL_PROFILE="cdp-windows")
+            assert dispatch() == 0 and not posts
+            os.environ.update(MANUAL_REPO="", MANUAL_PR="", MANUAL_PROFILE="")
+            assert dispatch() == 0 and len(posts) == 2
+            assert all(workflow == "windows.yml" for workflow, _ in posts)
+            live_tip = b
+            assert snapshot_current("Hoshivel", sr_frozen, "source", "cdp-windows")
+            assert not snapshot_current("Hoshivel", fabricated, "source", "cdp-windows")
+            Path(os.environ["GITHUB_OUTPUT"]).unlink()
+            posts.clear()
+            histories["windows.yml"].clear()
+            histories["cdp-windows.yml"].clear()
+
             # A result from the other route, even in this workflow's history,
             # must not suppress the intended work. Titles must match exactly.
             histories["windows.yml"] = [{"display_title": title("ShatteredRealms", a, "cdp-windows")}]
@@ -652,7 +704,6 @@ def selftest() -> int:
             fixtures[("ShatteredRealms", 10)] = fixture_pr("ShatteredRealms", 10, a, c)
             assert dispatch() == 0
             assert [workflow for workflow, _ in posts] == ["windows.yml", "cdp-windows.yml"]
-            sr_frozen = Candidate("ShatteredRealms", 7, a, b, c)
             assert all(body == {"ref": "main", "inputs": sr_frozen.inputs()} for _, body in posts)
             assert "selected=2 deferred=3" in output.getvalue()
             assert len(posts) == MAX_DISPATCH == 2
