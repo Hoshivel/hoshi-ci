@@ -22,5 +22,9 @@
   "cdp_windows": [
     "ShatteredRealms"
   ],
-  "enabled_cdp_windows": []
+  "enabled_cdp_windows": [],
+  "guides_windows": [
+    "workspace"
+  ],
+  "enabled_guides_windows": []
 }

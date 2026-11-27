@@ -1,0 +1,153 @@
+# 具名 Windows guides 代跑；來源與輸出界線沿用 Windows 工作。
+name: Windows Guides
+run-name: Windows Guides ${{ inputs.repo }}@${{ inputs.sha }}
+
+on:
+  # 只有手動與 `dispatch.yml`。這支拿得到 HOSHIVEL_CI_TOKEN，外人觸發得了的事件
+  # 一個都不掛（同 `dispatch.yml`）。
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: 被驗證的倉庫（必須列在 targets.json 的 guides_windows）
+        required: true
+        type: string
+      sha:
+        description: 40 字元的 PR head SHA（派工去重身分）
+        required: true
+        type: string
+      base:
+        description: 凍結時的 40 字元 main base SHA
+        required: true
+        type: string
+      merge:
+        description: 凍結時的 40 字元合併 SHA（實際驗證的樹）
+        required: true
+        type: string
+      pr:
+        description: 來源倉庫的 Ready PR 編號
+        required: true
+        type: string
+
+# 同一個 PR head 同時只跑一次；base 前進不建立另一份派工。
+concurrency:
+  group: guides-windows-${{ inputs.repo }}-${{ inputs.sha }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  eligibility:
+    name: Ready PR admission
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      allowed: ${{ steps.check.outputs.allowed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - id: check
+        env:
+          SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
+          REPO: ${{ inputs.repo }}
+          SHA: ${{ inputs.sha }}
+          BASE: ${{ inputs.base }}
+          MERGE: ${{ inputs.merge }}
+          PR: ${{ inputs.pr }}
+        run: python3 tools/dispatch.py admit --profile guides-windows --repo "$REPO" --sha "$SHA" --base "$BASE" --merge "$MERGE" --pr "$PR"
+
+  verify:
+    name: Windows guides
+    needs: eligibility
+    if: needs.eligibility.outputs.allowed == 'true'
+    runs-on: windows-latest
+    # 被驗證 job 自己的 timeout-minutes 由 run-job.py 執行；這裡是整個 job 的上限，
+    # 多出來的是 checkout 與 Python 安裝。
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: ci
+          persist-credentials: false
+
+      # 輸入經 env 交給腳本，不以 `${{ }}` 直接展開進 shell。
+      - name: 檢查輸入
+        env:
+          REPO: ${{ inputs.repo }}
+          SHA: ${{ inputs.sha }}
+          BASE: ${{ inputs.base }}
+          MERGE: ${{ inputs.merge }}
+          PR: ${{ inputs.pr }}
+        run: python ci/tools/dispatch.py check --profile guides-windows --repo "$REPO" --sha "$SHA" --base "$BASE" --merge "$MERGE" --pr "$PR"
+
+      - name: Recheck Ready PR before source checkout
+        id: current
+        env:
+          SOURCE_TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
+          REPO: ${{ inputs.repo }}
+          SHA: ${{ inputs.sha }}
+          BASE: ${{ inputs.base }}
+          MERGE: ${{ inputs.merge }}
+          PR: ${{ inputs.pr }}
+        run: python ci/tools/dispatch.py admit --profile guides-windows --repo "$REPO" --sha "$SHA" --base "$BASE" --merge "$MERGE" --pr "$PR"
+
+      # 不用 actions/checkout：它會把 commit 標題印進日誌（`HEAD is now at …`），而那是
+      # 私有倉庫的內容。這裡自己 fetch，全部帶 -q；憑證只存在取得來源這一步的行程環境。
+      - name: 取得被驗證的 commit
+        if: steps.current.outputs.allowed == 'true'
+        env:
+          TOKEN: ${{ secrets.HOSHIVEL_CI_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ inputs.repo }}
+          SHA: ${{ inputs.merge }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TOKEN}" ]; then
+            echo "::error::缺少 HOSHIVEL_CI_TOKEN。本倉庫須可讀此 organization secret；來源準入需要 Contents: read 與 Pull requests: read。"
+            exit 1
+          fi
+          export GIT_CONFIG_COUNT=1
+          export GIT_CONFIG_KEY_0="url.https://x-access-token:${TOKEN}@github.com/.insteadOf"
+          export GIT_CONFIG_VALUE_0="https://github.com/"
+          git init -q src
+          git -C src remote add origin "https://github.com/${OWNER}/${REPO}"
+          git -C src config core.longpaths true
+          git -C src config core.sparseCheckout true
+          git -C src config core.sparseCheckoutCone false
+          git -C src config remote.origin.promisor true
+          git -C src config remote.origin.partialclonefilter blob:none
+          printf '/.github/workflows/windows-guides.yml\n/tools/check-agent-rules.py\n/tools/_console.py\n' > src/.git/info/sparse-checkout
+          if ! git -C src fetch -q --filter=blob:none --depth=1 --no-tags origin "${SHA}" > "${RUNNER_TEMP}/source-fetch.log" 2>&1; then
+            echo "::error::Source fetch failed; private output withheld"
+            exit 1
+          fi
+          if ! git -C src -c advice.detachedHead=false checkout -q FETCH_HEAD > "${RUNNER_TEMP}/source-checkout.log" 2>&1; then
+            echo "::error::Source checkout failed; private output withheld"
+            exit 1
+          fi
+          test "$(git -C src rev-parse HEAD)" = "${SHA}"
+          test -f src/.github/workflows/windows-guides.yml
+          test -f src/tools/check-agent-rules.py
+          test -f src/tools/_console.py
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.current.outputs.allowed == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: 安裝 PyYAML
+        if: steps.current.outputs.allowed == 'true'
+        run: python -m pip install --disable-pip-version-check --quiet pyyaml==6.0.3
+
+      - name: Read admitted Python job definition
+        id: plan
+        if: steps.current.outputs.allowed == 'true'
+        run: python ci/tools/run-job.py plan --profile guides-windows --src src --output "${GITHUB_OUTPUT}"
+
+      - name: Windows guides
+        if: steps.current.outputs.allowed == 'true'
+        run: python ci/tools/run-job.py run --profile guides-windows --src src

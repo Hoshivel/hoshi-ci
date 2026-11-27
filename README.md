@@ -16,6 +16,18 @@ action revision 必須與公開控制端精確相符。main 前進後重試須�
 與 GitHub merge，直接建立新的 `cdp-windows.yml` 工作；`gh run rerun` 沿用舊輸入，
 `dispatch.yml` 對相同 head 仍去重，均不會刷新已派工的來源。
 
+`guides-windows` 只供 `workspace` 檢查器的具名 Windows 自測，必須手動指定 PR。
+`guides_windows` 只允許 `workspace`；`enabled_guides_windows` 必須維持空清單，非空即拒絕，
+不得加入自動排程。這條路線有獨立的 `Windows Guides` 標題與歷史，沿用每輪合計兩項的
+上限；停用時不讀取它的工作歷史。準入、runner 分配及取得來源前均驗證 GitHub 的目前
+Ready PR、main 與合併提交，不能沿用過時或自行組成的 merge。
+
+`guides-windows.yml` 只以 blob 篩選與非 cone sparse checkout 取得凍結來源的
+`.github/workflows/windows-guides.yml`、`tools/check-agent-rules.py` 與 `tools/_console.py`。
+它先安裝固定 Python 3.12，再安裝解析器相依、讀取來源 `guides` job 並執行。
+來源 invocation 由摘要固定，命令正本仍只在來源；不下載 Go／npm 相依、不使用快取，
+來源執行不持有 token，步驟名稱及輸出仍由同一個抑制器保護。
+
 在這個公開倉庫的 runner 上，代跑 Hoshivel 私有倉庫的 Windows 原生驗證。
 
 ## 做什麼
@@ -88,6 +100,7 @@ gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f dry_run=true
 gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f repo=hoshi-identity
 gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f repo=hoshi-data -f pr=<PR 編號> -f dry_run=true
 gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f profile=cdp-windows -f repo=ShatteredRealms -f pr=<PR 編號>
+gh workflow run dispatch.yml -R Hoshivel/hoshi-ci -f profile=guides-windows -f repo=workspace -f pr=<PR 編號>
 gh workflow run windows.yml -R Hoshivel/hoshi-ci -f repo=hoshi-data -f pr=<PR 編號> \
   -f sha=<40 字元 PR head> -f base=<40 字元凍結 base> -f merge=<40 字元凍結合併提交>
 gh run list -R Hoshivel/hoshi-ci -w windows.yml
@@ -102,5 +115,13 @@ CDP 刷新重試直接指定重新核對的身分：
 
 ```sh
 gh workflow run cdp-windows.yml -R Hoshivel/hoshi-ci -f repo=ShatteredRealms -f pr=<PR 編號> \
+  -f sha=<目前 Ready head> -f base=<目前 main> -f merge=<GitHub 回報且雙親匹配的 merge>
+```
+
+Windows 檢查器自測也可直接指定重新核對的身分；`Ready PR admission`、
+`Windows guides` job 與同名來源步驟都須成功，並核對同一 PR 的 head、base、merge 與 checkout：
+
+```sh
+gh workflow run guides-windows.yml -R Hoshivel/hoshi-ci -f repo=workspace -f pr=<PR 編號> \
   -f sha=<目前 Ready head> -f base=<目前 main> -f merge=<GitHub 回報且雙親匹配的 merge>
 ```

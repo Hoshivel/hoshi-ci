@@ -21,6 +21,8 @@ action 一律是錯誤，不是跳過：一個安靜沒跑的步驟，與一個�
   run-job.py run  --src DIR   執行 run 步驟
   run-job.py plan --src DIR --profile cdp-windows
                               讀固定 CDP job，輸出 node-version
+  run-job.py plan --src DIR --profile guides-windows
+                              讀固定文件檢查 job，輸出 python-version
   run-job.py selftest         只跑內建案例
 """
 
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import os
 import re
@@ -46,10 +49,15 @@ RUNS_ON = "windows-latest"
 PROFILES = {
     "windows": (WORKFLOW, JOB),
     "cdp-windows": (".github/workflows/cdp-lifecycle.yml", "lifecycle"),
+    "guides-windows": (".github/workflows/windows-guides.yml", "guides"),
 }
 CDP_CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 CDP_SETUP_NODE = "actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1"
 CDP_ACTIONS = frozenset((CDP_CHECKOUT, CDP_SETUP_NODE))
+GUIDES_SETUP_PYTHON = "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"
+GUIDES_ACTIONS = frozenset((CDP_CHECKOUT, GUIDES_SETUP_PYTHON))
+# Only the digest of the approved private source invocation is public.
+GUIDES_SCRIPT_SHA256 = "4a947712ec584b67226defc28ca33b1aaa125c224c7724a1b1b92b5b3e405cb2"
 
 JOB_KEYS = {"if", "name", "needs", "runs-on", "timeout-minutes", "env", "defaults", "steps"}
 STEP_KEYS = {"name", "id", "run", "uses", "with", "env", "shell", "working-directory"}
@@ -88,6 +96,7 @@ class Plan:
     steps: list[Step]
     notes: list[str] = field(default_factory=list)
     node_version: str | None = None
+    python_version: str | None = None
 
     @property
     def module_dir(self) -> str:
@@ -141,6 +150,9 @@ def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan
     unknown = set(job) - JOB_KEYS
     if unknown:
         raise JobError(f"job 有不認得的鍵：{', '.join(sorted(unknown))}")
+    if profile == "guides-windows" and any(key in scope for scope in (doc, job)
+                                            for key in ("env", "defaults")):
+        raise JobError("guides cannot change the workflow or job environment and defaults")
     # The dispatcher and worker admission independently bind an open Ready PR
     # to this source. This dependency supplies no build outputs or services.
     # No other prerequisite can be silently omitted by the portable runner.
@@ -151,6 +163,8 @@ def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan
     timeout = job.get("timeout-minutes", DEFAULT_TIMEOUT)
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
         raise JobError(f"timeout-minutes 必須是正整數：{timeout!r}")
+    if profile == "guides-windows" and timeout != 5:
+        raise JobError("guides require a five-minute source timeout")
 
     env: dict[str, str] = {}
     for scope, mapping in (("workflow env", doc.get("env")), ("job env", job.get("env"))):
@@ -179,7 +193,9 @@ def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan
     notes: list[str] = []
     go_version_file: str | None = None
     node_version: str | None = None
+    python_version: str | None = None
     checkout_seen = False
+    strict_actions = {"cdp-windows": CDP_ACTIONS, "guides-windows": GUIDES_ACTIONS}.get(profile)
 
     for index, step in enumerate(job.get("steps") or [], 1):
         where = f"第 {index} 步"
@@ -192,23 +208,27 @@ def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan
         if "uses" in step:
             if "run" in step:
                 raise JobError(f"{where} 同時有 uses 與 run")
-            if profile == "cdp-windows" and (
+            if strict_actions is not None and (
                     not isinstance(step["uses"], str)
-                    or step["uses"] not in CDP_ACTIONS):
-                raise JobError("CDP action revision is not supported")
+                    or step["uses"] not in strict_actions):
+                raise JobError("action revision is not supported by this profile")
             action = str(step["uses"]).split("@", 1)[0]
             options = step.get("with") or {}
             if not isinstance(options, dict):
                 raise JobError("action options must be a mapping")
-            if profile == "cdp-windows" and set(step) - {"name", "uses", "with"}:
-                raise JobError("unsupported CDP action fields")
+            if strict_actions is not None and set(step) - {"name", "uses", "with"}:
+                raise JobError("unsupported action fields")
             if action == "actions/checkout":
                 # The workflow has already checked out this commit; options
                 # would mean a different checkout, which is not replicated.
-                if options:
+                if profile == "guides-windows":
+                    if options != {"persist-credentials": False}:
+                        raise JobError("guides checkout must disable credential persistence without other options")
+                elif options:
                     raise JobError(f"{where}：actions/checkout 帶了選項，這裡不重現")
-                if profile == "cdp-windows" and (checkout_seen or node_version is not None or steps):
-                    raise JobError("CDP checkout must occur once before setup and execution")
+                if strict_actions is not None and (checkout_seen or node_version is not None
+                                                   or python_version is not None or steps):
+                    raise JobError("checkout must occur once before setup and execution")
                 checkout_seen = True
                 continue
             if action == "actions/setup-go":
@@ -231,11 +251,22 @@ def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan
                     raise JobError("CDP requires Node 22 without cache or other setup options")
                 node_version = "22"
                 continue
+            if action == "actions/setup-python":
+                if profile != "guides-windows":
+                    raise JobError("Python setup is not allowed by this profile")
+                if python_version is not None or steps or not checkout_seen:
+                    raise JobError("Python setup must occur once after checkout and before execution")
+                if options != {"python-version": "3.12"}:
+                    raise JobError("guides require Python 3.12 without cache or other setup options")
+                python_version = "3.12"
+                continue
             raise JobError("action is not supported by this profile")
 
         run = step.get("run")
         if not isinstance(run, str) or not run.strip():
             raise JobError(f"{where} 沒有 run")
+        if profile == "guides-windows" and set(step) - {"name", "run"}:
+            raise JobError("guides require the default shell, directory and environment")
         step_env = step.get("env") or {}
         if not isinstance(step_env, dict):
             raise JobError(f"{where} 的 env 不是 mapping")
@@ -269,9 +300,15 @@ def build_plan(doc: dict, job_name: str = JOB, profile: str = "windows") -> Plan
         raise JobError("沒有 actions/setup-go 的 go-version-file")
     if profile == "cdp-windows" and node_version is None:
         raise JobError("CDP requires Node setup")
+    if profile == "guides-windows" and python_version is None:
+        raise JobError("guides require Python setup")
+    if profile == "guides-windows" and (
+            len(steps) != 1 or hashlib.sha256(steps[0].script.strip().encode("utf-8")).hexdigest()
+            != GUIDES_SCRIPT_SHA256):
+        raise JobError("guides require the single approved source invocation")
     if not steps:
         raise JobError("沒有任何 run 步驟")
-    return Plan(go_version_file, timeout, env, steps, notes, node_version)
+    return Plan(go_version_file, timeout, env, steps, notes, node_version, python_version)
 
 
 def load_plan(src: Path, workflow: str | None = None, job: str | None = None,
@@ -416,7 +453,7 @@ def execute(plan: Plan, src: Path) -> int:
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as out:
-            label = "CDP Windows" if plan.node_version else JOB
+            label = "Windows Guides" if plan.python_version else "CDP Windows" if plan.node_version else JOB
             out.write(f"### {label}\n\n| 步驟 | 結果 | 時間 |\n|---|---|---|\n")
             for label, result, elapsed in rows:
                 out.write(f"| `{label}` | {result} | {elapsed} |\n")
@@ -544,6 +581,108 @@ def selftest() -> int:
         except JobError:
             continue
         raise AssertionError(f"CDP should reject: {what}")
+
+    # A generic Python workload exercises the profile without copying the
+    # private source command into this public repository.
+    guides = {
+        "jobs": {"guides": {
+            "runs-on": RUNS_ON,
+            "timeout-minutes": 5,
+            "steps": [
+                {"uses": CDP_CHECKOUT, "with": {"persist-credentials": False}},
+                {"uses": GUIDES_SETUP_PYTHON, "with": {"python-version": "3.12"}},
+                {"run": "python -c \"print('fixture')\""},
+            ],
+        }},
+    }
+    from unittest.mock import patch
+    fixture_digest = hashlib.sha256(guides["jobs"]["guides"]["steps"][2]["run"].encode("utf-8")).hexdigest()
+
+    def build_guides(document):
+        with patch.object(sys.modules[__name__], "GUIDES_SCRIPT_SHA256", fixture_digest):
+            return build_plan(document, "guides", "guides-windows")
+
+    try:
+        build_plan(guides, "guides", "guides-windows")
+    except JobError:
+        pass
+    else:
+        raise AssertionError("generic fixture must not match the approved private invocation")
+    guides_plan = build_guides(guides)
+    assert guides_plan.python_version == "3.12"
+    assert guides_plan.go_version_file is None and guides_plan.node_version is None
+    assert guides_plan.timeout_minutes == 5 and len(guides_plan.steps) == 1
+    assert guides_plan.steps[0].shell == "pwsh" and guides_plan.steps[0].cwd == "."
+    assert guides_plan.notes == []
+    try:
+        guides_plan.module_dir
+    except JobError:
+        pass
+    else:
+        raise AssertionError("Python profile must not identify a Go module")
+    guides_rejected = {
+        "missing checkout": lambda j: j["steps"].pop(0),
+        "duplicate checkout": lambda j: j["steps"].insert(1, copy.deepcopy(j["steps"][0])),
+        "missing setup": lambda j: j["steps"].pop(1),
+        "duplicate setup": lambda j: j["steps"].insert(2, copy.deepcopy(j["steps"][1])),
+        "late setup": lambda j: j["steps"].append(j["steps"].pop(1)),
+        "setup before checkout": lambda j: j["steps"].insert(0, j["steps"].pop(1)),
+        "other Python": lambda j: j["steps"][1]["with"].update({"python-version": "3.13"}),
+        "numeric Python": lambda j: j["steps"][1]["with"].update({"python-version": 3.12}),
+        "Python file selector": lambda j: j["steps"][1].update({"with": {"python-version-file": "version.txt"}}),
+        "setup cache": lambda j: j["steps"][1]["with"].update({"cache": "pip"}),
+        "empty setup cache": lambda j: j["steps"][1]["with"].update({"cache": ""}),
+        "setup environment": lambda j: j["steps"][1].update({"env": {"X": "value"}}),
+        "checkout without pin": lambda j: j["steps"][0].update({"uses": "actions/checkout"}),
+        "other checkout commit": lambda j: j["steps"][0].update({"uses": "actions/checkout@" + "1" * 40}),
+        "checkout persistence": lambda j: j["steps"][0]["with"].update({"persist-credentials": True}),
+        "missing persistence guard": lambda j: j["steps"][0].pop("with"),
+        "checkout source override": lambda j: j["steps"][0]["with"].update({"ref": "other"}),
+        "other Python commit": lambda j: j["steps"][1].update({"uses": "actions/setup-python@" + "1" * 40}),
+        "Python tag pin": lambda j: j["steps"][1].update({"uses": "actions/setup-python@v7"}),
+        "Python variable pin": lambda j: j["steps"][1].update({"uses": "actions/setup-python@${{ vars.SHA }}"}),
+        "Python missing pin": lambda j: j["steps"][1].update({"uses": "actions/setup-python@"}),
+        "Go setup": lambda j: j["steps"].insert(2, copy.deepcopy(base["jobs"][JOB]["steps"][1])),
+        "Node setup": lambda j: j["steps"].insert(2, copy.deepcopy(cdp["jobs"]["lifecycle"]["steps"][1])),
+        "credential omission": lambda j: j["steps"].insert(2, copy.deepcopy(base["jobs"][JOB]["steps"][2])),
+        "run expression": lambda j: j["steps"][2].update({"run": "python ${{ matrix.test }}"}),
+        "other prerequisite": lambda j: j.update({"needs": ["build"]}),
+        "no source command": lambda j: j["steps"].pop(2),
+        "echo success substitute": lambda j: j["steps"][2].update({"run": "echo success"}),
+        "additional script work": lambda j: j["steps"][2].update({"run": j["steps"][2]["run"] + "\necho additional"}),
+        "second source step": lambda j: j["steps"].append(copy.deepcopy(j["steps"][2])),
+        "different shell": lambda j: j["steps"][2].update({"shell": "bash"}),
+        "explicit shell": lambda j: j["steps"][2].update({"shell": "pwsh"}),
+        "different directory": lambda j: j["steps"][2].update({"working-directory": "other"}),
+        "step environment": lambda j: j["steps"][2].update({"env": {"PYTHONOPTIMIZE": "1"}}),
+        "job environment": lambda j: j.update({"env": {"PYTHONOPTIMIZE": "1"}}),
+        "job defaults": lambda j: j.update({"defaults": {"run": {"shell": "bash"}}}),
+        "shorter timeout": lambda j: j.update({"timeout-minutes": 4}),
+        "longer timeout": lambda j: j.update({"timeout-minutes": 6}),
+        "missing timeout": lambda j: j.pop("timeout-minutes"),
+        "string timeout": lambda j: j.update({"timeout-minutes": "5"}),
+        "boolean timeout": lambda j: j.update({"timeout-minutes": True}),
+    }
+    for what, mutate in guides_rejected.items():
+        changed = copy.deepcopy(guides)
+        mutate(changed["jobs"]["guides"])
+        try:
+            build_guides(changed)
+        except JobError:
+            continue
+        raise AssertionError(f"guides should reject: {what}")
+    for key, value in (("env", {"PYTHONOPTIMIZE": "1"}),
+                       ("defaults", {"run": {"working-directory": "other"}})):
+        changed = copy.deepcopy(guides)
+        changed[key] = value
+        try:
+            build_guides(changed)
+        except JobError:
+            continue
+        raise AssertionError(f"guides should reject workflow {key}")
+    padded = copy.deepcopy(guides)
+    padded["jobs"]["guides"]["steps"][2]["run"] = "\n " + padded["jobs"]["guides"]["steps"][2]["run"] + " \n"
+    assert build_guides(padded).python_version == "3.12"
     import yaml
     wrapper_path = Path(__file__).resolve().parent.parent / ".github/workflows/cdp-windows.yml"
     wrapper = yaml.safe_load(wrapper_path.read_text(encoding="utf-8"))
@@ -551,8 +690,17 @@ def selftest() -> int:
                        for step in job["steps"] if "uses" in step]
     assert [action for action in wrapper_actions if action.startswith("actions/setup-node@")] == [CDP_SETUP_NODE]
     assert all(action == CDP_CHECKOUT for action in wrapper_actions if action.startswith("actions/checkout@"))
+    guides_wrapper_path = Path(__file__).resolve().parent.parent / ".github/workflows/guides-windows.yml"
+    guides_wrapper = yaml.safe_load(guides_wrapper_path.read_text(encoding="utf-8"))
+    guides_wrapper_actions = [step["uses"] for job in guides_wrapper["jobs"].values()
+                              for step in job["steps"] if "uses" in step]
+    assert [action for action in guides_wrapper_actions if action.startswith("actions/setup-python@")] == [GUIDES_SETUP_PYTHON]
+    assert all(action == CDP_CHECKOUT for action in guides_wrapper_actions if action.startswith("actions/checkout@"))
     for arguments in (("unknown", None, None), ("windows", None, "lifecycle"),
-                      ("cdp-windows", WORKFLOW, None), ("cdp-windows", None, JOB)):
+                      ("cdp-windows", WORKFLOW, None), ("cdp-windows", None, JOB),
+                      ("guides-windows", WORKFLOW, None), ("guides-windows", None, JOB),
+                      ("guides-windows", ".github/workflows/cdp-lifecycle.yml", "guides"),
+                      ("cdp-windows", ".github/workflows/windows-guides.yml", "guides")):
         try:
             profile_source(*arguments)
         except JobError:
@@ -597,9 +745,10 @@ def selftest() -> int:
     with tempfile.TemporaryDirectory() as folder:
         work = Path(folder)
         summary = work / "summary.md"
-        for module, node in (("go.mod", None), (None, "22")):
+        for module, node, python in (("go.mod", None, None), (None, "22", None), (None, None, "3.12")):
             public = io.StringIO()
-            sample = Plan(module, 1, {}, [Step(private, "pwsh", private, {}, ".")], node_version=node)
+            sample = Plan(module, 1, {}, [Step(private, "pwsh", private, {}, ".")],
+                          node_version=node, python_version=python)
             with patch.dict(os.environ, {"RUNNER_TEMP": folder, "GITHUB_STEP_SUMMARY": str(summary)}), \
                  patch.object(sys.modules[__name__], "command", return_value=[sys.executable, "-c", script]), \
                  contextlib.redirect_stdout(public):
@@ -618,6 +767,15 @@ def selftest() -> int:
             assert main(["plan", "--src", str(work), "--profile", "cdp-windows",
                          "--output", str(output)]) == 0
         assert output.read_text(encoding="utf-8") == "node-version=22\n"
+        assert public.getvalue() == "Job definition accepted\n"
+        (invalid / "windows-guides.yml").write_text(yaml.safe_dump(guides), encoding="utf-8")
+        python_output = work / "python-plan-output"
+        public = io.StringIO()
+        with patch.object(sys.modules[__name__], "GUIDES_SCRIPT_SHA256", fixture_digest), \
+                contextlib.redirect_stdout(public):
+            assert main(["plan", "--src", str(work), "--profile", "guides-windows",
+                         "--output", str(python_output)]) == 0
+        assert python_output.read_text(encoding="utf-8") == "python-version=3.12\n"
         assert public.getvalue() == "Job definition accepted\n"
         public = io.StringIO()
         with contextlib.redirect_stdout(public):
@@ -685,6 +843,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "plan":
         if plan.node_version is not None:
             lines = f"node-version={plan.node_version}\n"
+        elif plan.python_version is not None:
+            lines = f"python-version={plan.python_version}\n"
         else:
             lines = f"go-version-file={plan.go_version_file}\nmodule-dir={plan.module_dir}\n"
         if args.output:
